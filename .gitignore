@@ -1,0 +1,12 @@
+# 生成的截图
+*.png
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# macOS 系统文件
+.DS_Store
+
+# 用户保存的数据文件 (JSON)
+data/
