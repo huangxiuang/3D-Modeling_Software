@@ -23,12 +23,14 @@ from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtCore import Qt, QTimer
 import pyvistaqt as pvqt
 
-# Optional: 3D plotting for flight data companion plot
+# Optional: matplotlib for plotting and embedded dialogs
 try:
     import matplotlib
-    matplotlib.use("Agg")
+    matplotlib.use("Qt5Agg")
     import matplotlib.pyplot as plt
     from mpl_toolkits.mplot3d import Axes3D
+    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+    from matplotlib.figure import Figure
 
     _HAS_MPL = True
 except ImportError:
@@ -500,7 +502,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_wp.clicked.connect(self._on_wp_button)
         pl.addWidget(self._btn_wp)
 
-        pl.addWidget(QtWidgets.QLabel("— 或输入坐标 —"))
+        self._btn_precise_wp = QtWidgets.QPushButton("精准添加路径点")
+        self._btn_precise_wp.clicked.connect(self._open_precise_wp_dialog)
+        pl.addWidget(self._btn_precise_wp)
 
         # Coordinate input row
         coord_row = QtWidgets.QHBoxLayout()
@@ -1532,6 +1536,19 @@ class MainWindow(QtWidgets.QMainWindow):
         z = self._wp_z.value()
         self._add_waypoint(np.array([x, y, z]))
 
+    def _open_precise_wp_dialog(self):
+        if not _HAS_MPL:
+            QtWidgets.QMessageBox.warning(
+                self, "提示",
+                "精准添加路径点需要 matplotlib 支持。\n请安装: pip install matplotlib"
+            )
+            return
+        dlg = WaypointPreciseDialog(self)
+        if dlg.exec_() == QtWidgets.QDialog.Accepted:
+            xyz = dlg.get_coords()
+            self._add_waypoint(np.array(xyz))
+            self._show_path()
+
     def _clear_waypoints(self):
         self.waypoints.clear()
         for a in self._wp_actors:
@@ -2208,3 +2225,155 @@ class MainWindow(QtWidgets.QMainWindow):
             "<li>多对象场景 (地形/河流/植被/飞行器/鸟/树)</li>"
             "</ul>",
         )
+
+
+class WaypointPreciseDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("精准添加路径点")
+        self.setMinimumSize(640, 520)
+
+        self._stack = QtWidgets.QStackedWidget()
+        self._stack.addWidget(self._create_step1())
+        self._stack.addWidget(self._create_step2())
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(self._stack)
+        self._stack.setCurrentIndex(0)
+
+    def _create_step1(self):
+        widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(widget)
+
+        title = QtWidgets.QLabel("精准添加路径点 — 选择 XY 坐标")
+        title.setStyleSheet("font-weight: bold; font-size: 14px;")
+        layout.addWidget(title)
+
+        self._fig_xy = Figure(figsize=(5, 4))
+        self._ax_xy = self._fig_xy.add_subplot(111)
+        self._ax_xy.set_xlim(-10, 10)
+        self._ax_xy.set_ylim(-10, 10)
+        self._ax_xy.set_aspect("equal")
+        self._ax_xy.grid(True, linestyle="--", alpha=0.7)
+        self._ax_xy.set_xlabel("X")
+        self._ax_xy.set_ylabel("Y")
+        self._ax_xy.axhline(0, color="gray", linewidth=0.5)
+        self._ax_xy.axvline(0, color="gray", linewidth=0.5)
+
+        self._canvas_xy = FigureCanvasQTAgg(self._fig_xy)
+        self._canvas_xy.mpl_connect("button_press_event", self._on_xy_click)
+        layout.addWidget(self._canvas_xy)
+
+        spin_layout = QtWidgets.QHBoxLayout()
+        self._spin_x = QtWidgets.QDoubleSpinBox()
+        self._spin_x.setRange(-20, 20)
+        self._spin_x.setDecimals(2)
+        self._spin_x.setPrefix("X: ")
+        self._spin_x.valueChanged.connect(self._on_xy_spin_changed)
+        self._spin_y = QtWidgets.QDoubleSpinBox()
+        self._spin_y.setRange(-20, 20)
+        self._spin_y.setDecimals(2)
+        self._spin_y.setPrefix("Y: ")
+        self._spin_y.valueChanged.connect(self._on_xy_spin_changed)
+        spin_layout.addWidget(self._spin_x)
+        spin_layout.addWidget(self._spin_y)
+        spin_layout.addStretch()
+        layout.addLayout(spin_layout)
+
+        btn_layout = QtWidgets.QHBoxLayout()
+        btn_cancel = QtWidgets.QPushButton("取消")
+        btn_cancel.clicked.connect(self.reject)
+        btn_next = QtWidgets.QPushButton("下一步")
+        btn_next.clicked.connect(self._go_step2)
+        btn_layout.addStretch()
+        btn_layout.addWidget(btn_cancel)
+        btn_layout.addWidget(btn_next)
+        layout.addLayout(btn_layout)
+
+        return widget
+
+    def _create_step2(self):
+        widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(widget)
+
+        title = QtWidgets.QLabel("精准添加路径点 — 选择高度 Z")
+        title.setStyleSheet("font-weight: bold; font-size: 14px;")
+        layout.addWidget(title)
+
+        self._fig_z = Figure(figsize=(5, 1.5))
+        self._ax_z = self._fig_z.add_subplot(111)
+        self._ax_z.set_xlim(-10, 10)
+        self._ax_z.set_ylim(-0.5, 0.5)
+        self._ax_z.set_yticks([])
+        self._ax_z.set_xlabel("Z")
+        self._ax_z.grid(True, linestyle="--", alpha=0.7, axis="x")
+        self._ax_z.axvline(0, color="gray", linewidth=0.5)
+
+        self._canvas_z = FigureCanvasQTAgg(self._fig_z)
+        self._canvas_z.mpl_connect("button_press_event", self._on_z_click)
+        layout.addWidget(self._canvas_z)
+
+        self._spin_z = QtWidgets.QDoubleSpinBox()
+        self._spin_z.setRange(-20, 20)
+        self._spin_z.setDecimals(2)
+        self._spin_z.setPrefix("Z: ")
+        self._spin_z.valueChanged.connect(self._on_z_spin_changed)
+        layout.addWidget(self._spin_z)
+
+        btn_layout = QtWidgets.QHBoxLayout()
+        btn_prev = QtWidgets.QPushButton("上一步")
+        btn_prev.clicked.connect(lambda: self._stack.setCurrentIndex(0))
+        btn_ok = QtWidgets.QPushButton("确定")
+        btn_ok.clicked.connect(self.accept)
+        btn_layout.addWidget(btn_prev)
+        btn_layout.addStretch()
+        btn_layout.addWidget(btn_ok)
+        layout.addLayout(btn_layout)
+
+        return widget
+
+    def _on_xy_click(self, event):
+        if event.inaxes != self._ax_xy:
+            return
+        self._spin_x.setValue(event.xdata)
+        self._spin_y.setValue(event.ydata)
+
+    def _on_xy_spin_changed(self):
+        x = self._spin_x.value()
+        y = self._spin_y.value()
+        self._ax_xy.clear()
+        self._ax_xy.set_xlim(-10, 10)
+        self._ax_xy.set_ylim(-10, 10)
+        self._ax_xy.set_aspect("equal")
+        self._ax_xy.grid(True, linestyle="--", alpha=0.7)
+        self._ax_xy.set_xlabel("X")
+        self._ax_xy.set_ylabel("Y")
+        self._ax_xy.axhline(0, color="gray", linewidth=0.5)
+        self._ax_xy.axvline(0, color="gray", linewidth=0.5)
+        self._ax_xy.plot(x, y, "r+", markersize=12, markeredgewidth=2)
+        self._canvas_xy.draw_idle()
+
+    def _on_z_click(self, event):
+        if event.inaxes != self._ax_z:
+            return
+        self._spin_z.setValue(event.xdata)
+
+    def _on_z_spin_changed(self):
+        z = self._spin_z.value()
+        self._ax_z.clear()
+        self._ax_z.set_xlim(-10, 10)
+        self._ax_z.set_ylim(-0.5, 0.5)
+        self._ax_z.set_yticks([])
+        self._ax_z.set_xlabel("Z")
+        self._ax_z.grid(True, linestyle="--", alpha=0.7, axis="x")
+        self._ax_z.axvline(0, color="gray", linewidth=0.5)
+        self._ax_z.barh(0, z, height=0.3, color="steelblue", alpha=0.7)
+        self._ax_z.axvline(z, color="red", linewidth=2)
+        self._canvas_z.draw_idle()
+
+    def _go_step2(self):
+        self._stack.setCurrentIndex(1)
+        self._on_z_spin_changed()
+
+    def get_coords(self):
+        return [self._spin_x.value(), self._spin_y.value(), self._spin_z.value()]
