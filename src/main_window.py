@@ -1592,6 +1592,37 @@ class MainWindow(QtWidgets.QMainWindow):
             self._flight_aircraft_combo.setCurrentIndex(idx)
         self._flight_aircraft_combo.blockSignals(False)
 
+    # ────────────────────────────────────────────────────────────────
+    #  ID-15: Flight speed model (systematic, physics-aware)
+    # ────────────────────────────────────────────────────────────────
+
+    CRUISE_SPEED = 5.0
+    FLIGHT_INTERVAL_MS = 50
+    _MIN_FLIGHT_STEPS = 10
+    _MAX_FLIGHT_STEPS = 300
+
+    def _flight_speed(self, pitch_deg, yaw_rate_deg_s):
+        """Systematic speed model returning effective velocity.
+
+        V = V₀ × k_pitch(pitch) × k_turn(yaw_rate)
+
+        k_pitch = max(0.30, 1.0 − 0.35 × sin(pitch_rad))
+          pitch =  0° → k_pitch = 1.00  (level)
+          pitch = +30° → k_pitch = 0.83  (climbing, −17 %)
+          pitch = +60° → k_pitch = 0.70  (steep climb, −30 %)
+          pitch = −30° → k_pitch = 1.17  (diving, +17 %)
+          pitch = −60° → k_pitch = 1.30  (steep dive, +30 %)
+
+        k_turn = max(0.30, 1.0 − 0.006 × |yaw_rate|)
+          yaw_rate =   0 °/s → k_turn = 1.00
+          yaw_rate =  50 °/s → k_turn = 0.70
+          yaw_rate = 100 °/s → k_turn = 0.30  (clamped)
+        """
+        pitch_rad = math.radians(pitch_deg)
+        k_pitch = max(0.30, 1.0 - 0.35 * math.sin(pitch_rad))
+        k_turn = max(0.30, 1.0 - 0.006 * abs(yaw_rate_deg_s))
+        return self.CRUISE_SPEED * k_pitch * k_turn
+
     def _start_flight(self):
         """Animate the selected aircraft through all waypoints."""
         if self._flight_active:
@@ -1616,12 +1647,12 @@ class MainWindow(QtWidgets.QMainWindow):
         for wp in self.waypoints:
             path.append(np.array(wp))
 
-        # Build segments with computed yaw/pitch
+        # ── Build segments with speed-aware step count ──
         segments = []
-        interval_ms = 50
-        ms_per_segment = 2500  # 2.5 seconds per segment
-        steps = max(10, ms_per_segment // interval_ms)
+        interval_s = self.FLIGHT_INTERVAL_MS / 1000.0
 
+        # First pass: compute raw yaw/pitch for each segment
+        raw = []
         for i in range(len(path) - 1):
             p0 = path[i]
             p1 = path[i + 1]
@@ -1629,19 +1660,44 @@ class MainWindow(QtWidgets.QMainWindow):
             dy = p1[1] - p0[1]
             dz = p1[2] - p0[2]
             horiz_dist = np.sqrt(dx * dx + dy * dy) + 1e-12
+            dist = np.linalg.norm(p1 - p0) + 1e-12
 
-            # Yaw: heading from horizontal direction, 0=north (+Y), 90=east (+X)
             yaw = math.degrees(math.atan2(dx, dy)) % 360.0
-
-            # Pitch: vertical angle; positive when descending
             pitch = math.degrees(math.atan2(-dz, horiz_dist))
             pitch = max(-90.0, min(90.0, pitch))
 
+            raw.append({"dist": dist, "yaw": yaw, "pitch": pitch, "from": p0.tolist(), "to": p1.tolist()})
+
+        # Second pass: compute yaw-rate-aware speed & steps per segment
+        for i, r in enumerate(raw):
+            # Yaw change from previous segment (for turn factor)
+            if i > 0:
+                prev_yaw = raw[i - 1]["yaw"]
+                d_yaw = (r["yaw"] - prev_yaw) % 360.0
+                if d_yaw > 180.0:
+                    d_yaw -= 360.0
+            else:
+                d_yaw = 0.0
+
+            # Pitch factor → approximate speed for yaw-rate estimate
+            pitch_rad = math.radians(r["pitch"])
+            k_pitch_est = max(0.30, 1.0 - 0.35 * math.sin(pitch_rad))
+            approx_speed = self.CRUISE_SPEED * k_pitch_est
+            approx_time = r["dist"] / approx_speed if approx_speed > 0 else 999.0
+            yaw_rate = abs(d_yaw) / approx_time if approx_time > 0 else 0.0
+
+            # Final speed with turn factor
+            V = self._flight_speed(r["pitch"], yaw_rate)
+            segment_time = r["dist"] / V if V > 0 else 999.0
+            steps = max(self._MIN_FLIGHT_STEPS,
+                        min(self._MAX_FLIGHT_STEPS,
+                            int(round(segment_time / interval_s))))
+
             segments.append({
-                "from": p0.tolist(),
-                "to": p1.tolist(),
-                "yaw": yaw,
-                "pitch": pitch,
+                "from": r["from"],
+                "to": r["to"],
+                "yaw": r["yaw"],
+                "pitch": r["pitch"],
                 "roll": 0.0,
                 "steps": steps,
             })
@@ -1651,7 +1707,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "start_position": start_pos,
             "waypoints": [wp.tolist() for wp in self.waypoints],
             "segments": segments,
-            "interval_ms": interval_ms,
+            "interval_ms": self.FLIGHT_INTERVAL_MS,
         }
 
         # Start animation
@@ -1661,7 +1717,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._flight_segments = segments
         self._flight_segment_idx = 0
         self._flight_step = 0
-        self._flight_steps_per_segment = steps
+        self._flight_steps_per_segment = segments[0]["steps"] if segments else 50
         self._flight_data_cache = cache
 
         self._btn_start_flight.setText("停止飞行")
@@ -1672,7 +1728,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(
             f"飞行开始: {name} → {len(self.waypoints)} 个路径点", 3000
         )
-        self._flight_timer.start(interval_ms)
+        self._flight_timer.start(self.FLIGHT_INTERVAL_MS)
 
     def _stop_flight(self):
         """Stop the current flight animation."""
@@ -1685,6 +1741,50 @@ class MainWindow(QtWidgets.QMainWindow):
         self._flight_aircraft_combo.setEnabled(True)
         self._btn_save_flight.setEnabled(True)
         self._btn_load_flight.setEnabled(True)
+
+    # ────────────────────────────────────────────────────────────────
+    #  ID-14: Smooth flight path & attitude
+    # ────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _catmull_rom_position(path, seg_idx, t):
+        """Catmull-Rom spline interpolated position for segment seg_idx at t (0..1).
+
+        Produces smooth C1-continuous curves through all waypoints.
+        For boundary segments, phantom control points are mirrored to maintain tangency.
+        """
+        n = len(path)
+        p1 = path[seg_idx]
+        p2 = path[seg_idx + 1]
+
+        # Left neighbour (mirrored at boundary)
+        if seg_idx > 0:
+            p0 = path[seg_idx - 1]
+        else:
+            p0 = 2 * p1 - p2
+
+        # Right neighbour (mirrored at boundary)
+        if seg_idx + 2 < n:
+            p3 = path[seg_idx + 2]
+        else:
+            p3 = 2 * p2 - p1
+
+        t2 = t * t
+        t3 = t2 * t
+        return 0.5 * (
+            (2 * p1)
+            + (-p0 + p2) * t
+            + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2
+            + (-p0 + 3 * p1 - 3 * p2 + p3) * t3
+        )
+
+    @staticmethod
+    def _lerp_angle(a, b, t):
+        """Linearly interpolate between two angles (degrees), taking the shortest path across 0/360."""
+        d = (b - a) % 360.0
+        if d > 180.0:
+            d -= 360.0
+        return (a + d * t) % 360.0
 
     def _flight_tick(self):
         """Single animation step called by the flight timer."""
@@ -1707,25 +1807,39 @@ class MainWindow(QtWidgets.QMainWindow):
             t = step / float(steps) if steps > 0 else 1.0
             t = min(t, 1.0)
 
-            # Interpolate position
-            p0 = np.array(seg["from"])
-            p1 = np.array(seg["to"])
-            pos = p0 + t * (p1 - p0)
+            pos = self._catmull_rom_position(self._flight_path, seg_idx, t)
+
+            entry_yaw = float(seg["yaw"])
+            if seg_idx + 1 < len(segments):
+                exit_yaw = float(segments[seg_idx + 1]["yaw"])
+            else:
+                exit_yaw = entry_yaw
+            yaw = self._lerp_angle(entry_yaw, exit_yaw, t)
+
+            entry_pitch = float(seg["pitch"])
+            if seg_idx + 1 < len(segments):
+                exit_pitch = float(segments[seg_idx + 1]["pitch"])
+            else:
+                exit_pitch = entry_pitch
+            pitch = entry_pitch + (exit_pitch - entry_pitch) * t
+            pitch = max(-90.0, min(90.0, pitch))
+
+            roll = 0.0
 
             # Update transform
             if name in self._obj_transforms:
                 self._obj_transforms[name]["offset"] = pos.tolist()
-                self._obj_transforms[name]["yaw"] = seg["yaw"]
-                self._obj_transforms[name]["pitch"] = seg["pitch"]
-                self._obj_transforms[name]["roll"] = seg["roll"]
+                self._obj_transforms[name]["yaw"] = yaw
+                self._obj_transforms[name]["pitch"] = pitch
+                self._obj_transforms[name]["roll"] = roll
 
             # Update UI sliders (block signals to avoid double-trigger)
             self._set_slider_value(self._slider_obj_x, pos[0])
             self._set_slider_value(self._slider_obj_y, pos[1])
             self._set_slider_value(self._slider_obj_z, pos[2])
-            self._set_slider_value(self._slider_obj_yaw, seg["yaw"])
-            self._set_slider_value(self._slider_obj_pitch, seg["pitch"])
-            self._set_slider_value(self._slider_obj_roll, seg["roll"])
+            self._set_slider_value(self._slider_obj_yaw, yaw)
+            self._set_slider_value(self._slider_obj_pitch, pitch)
+            self._set_slider_value(self._slider_obj_roll, roll)
 
             # Apply to VTK actor
             self._apply_obj_transform_to_actor(name)
