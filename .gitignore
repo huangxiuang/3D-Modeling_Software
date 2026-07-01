@@ -1,5 +1,6 @@
 # 生成的截图
 *.png
+.omo/run-continuation/
 
 # Python 缓存
 __pycache__/
