@@ -124,15 +124,26 @@ class ClickablePlotter(pvqt.QtInteractor):
         if self.click_callback is None:
             return
         vtk_x, vtk_y = self._to_vtk_display(x, y)
-        picker = vtk.vtkPropPicker()
-        if picker.Pick(vtk_x, vtk_y, 0, self.renderer):
+
+        # Use vtkCellPicker for accurate surface intersection (more precise
+        # than PropPicker's prop-level pick, especially with overlaid layers).
+        picker = vtk.vtkCellPicker()
+        picker.SetTolerance(0.001)
+        if picker.Pick(vtk_x, vtk_y, 0, self.renderer) and picker.GetCellId() >= 0:
             world = np.array(picker.GetPickPosition())
             actor = picker.GetActor()
         else:
-            wp = vtk.vtkWorldPointPicker()
-            wp.Pick(vtk_x, vtk_y, 0, self.renderer)
-            world = np.array(wp.GetPickPosition())
-            actor = None
+            # Fallback: ray-terrain intersection via PropPicker on visible props
+            pp = vtk.vtkPropPicker()
+            if pp.Pick(vtk_x, vtk_y, 0, self.renderer):
+                world = np.array(pp.GetPickPosition())
+                actor = pp.GetActor()
+            else:
+                # Last resort: focal-plane pick (Z will be wrong, but XY roughly match)
+                wp = vtk.vtkWorldPointPicker()
+                wp.Pick(vtk_x, vtk_y, 0, self.renderer)
+                world = np.array(wp.GetPickPosition())
+                actor = None
         self.click_callback(x, y, world, actor)
 
 
@@ -152,7 +163,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("3DSceneSoftware — 3D 大场景可视化与目标建模")
-        self.resize(1620, 1020)
+        self.resize(1296, 816)
 
         # ── Config ──
         self.config = load_config()
@@ -193,6 +204,18 @@ class MainWindow(QtWidgets.QMainWindow):
         # River animation
         self._flowing = True
 
+        # Terrain layer management (ID-18)
+        self._terrain_layer_names = {
+            "layer_sand": "沙地",
+            "layer_grass": "草地",
+            "layer_earth": "土地",
+            "river": "河流",
+            "vegetation": "植被",
+        }
+        self._terrain_chks = {}        # name → QCheckBox
+        self._terrain_opacity_sliders = {}  # name → slider widget
+        self._terrain_opacity_setters = {}  # name → setter function
+
         # Flight animation (ID-11)
         self._flight_timer = QTimer(self)
         self._flight_timer.timeout.connect(self._flight_tick)
@@ -204,6 +227,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._flight_steps_per_segment = 0
         self._flight_aircraft = ""
         self._flight_data_cache = None  # saved for later export
+
+        # Per-aircraft waypoints (ID-20)
+        self._aircraft_waypoints = {}   # name → list of waypoints (shared path attribute)
+        # Saved flight states (ID-20)
+        self._saved_flight_states = []  # list of {offset, yaw, pitch, roll, time}
+        # Independent flight window (ID-20)
+        self._flight_window = None
+        # Timeline (ID-20)
+        self._total_flight_steps = 0
+        self._total_flight_time_ms = 0
 
         # ── Central 3D viewport ──
         self.plotter = ClickablePlotter(self)
@@ -481,14 +514,55 @@ class MainWindow(QtWidgets.QMainWindow):
     # ── Docks ───────────────────────────────────────
 
     def _setup_docks(self):
-        # ── Left: 场景元素 (scene tree) ──
-        dock_tree = QtWidgets.QDockWidget("场景元素", self)
+        # ── Left: 图层管理 (layer mgmt, ID-18) ──
+        dock_layers = QtWidgets.QDockWidget("图层管理", self)
+        lm_widget = QtWidgets.QWidget()
+        lm_layout = QtWidgets.QVBoxLayout(lm_widget)
+        lm_layout.setContentsMargins(4, 4, 4, 4)
+        lm_layout.setSpacing(3)
+
+        # Transparency explanation: left=opaque, right=transparent
+        hint = QtWidgets.QLabel("← 实心 ── 完全透明 →")
+        hint.setStyleSheet("color: #888; font-size: 11px; padding: 0 4px;")
+        hint.setAlignment(Qt.AlignRight)
+        lm_layout.addWidget(hint)
+
+        for layer_key, layer_label in self._terrain_layer_names.items():
+            row = QtWidgets.QHBoxLayout()
+            row.setSpacing(4)
+            chk = QtWidgets.QCheckBox(layer_label)
+            info = self.scene_objects.get(layer_key, {})
+            chk.setChecked(info.get("visible", True))
+            chk.toggled.connect(
+                lambda checked, n=layer_key: self._toggle_terrain_layer(n, checked)
+            )
+            row.addWidget(chk)
+            self._terrain_chks[layer_key] = chk
+
+            slider_w, slider_setter = self._create_opacity_slider(
+                1.0,
+                lambda val, n=layer_key: self._on_terrain_opacity(n, val),
+            )
+            row.addWidget(slider_w)
+            self._terrain_opacity_sliders[layer_key] = slider_w
+            self._terrain_opacity_setters[layer_key] = slider_setter
+
+            lm_layout.addLayout(row)
+
+        line = QtWidgets.QFrame()
+        line.setFrameShape(QtWidgets.QFrame.HLine)
+        line.setFrameShadow(QtWidgets.QFrame.Sunken)
+        lm_layout.addWidget(line)
+
+        lm_layout.addWidget(QtWidgets.QLabel("场景对象"))
         self.scene_tree = QtWidgets.QTreeWidget()
         self.scene_tree.setHeaderLabels(["名称", "类型"])
         self.scene_tree.setAlternatingRowColors(True)
         self.scene_tree.itemClicked.connect(self._on_tree_select)
-        dock_tree.setWidget(self.scene_tree)
-        self.addDockWidget(Qt.LeftDockWidgetArea, dock_tree)
+        lm_layout.addWidget(self.scene_tree, 1)
+
+        dock_layers.setWidget(lm_widget)
+        self.addDockWidget(Qt.LeftDockWidgetArea, dock_layers)
 
         # ── Left: 路径规划 ──
         dock_path = QtWidgets.QDockWidget("路径规划", self)
@@ -561,6 +635,45 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_load_flight.clicked.connect(self._load_flight_data)
         flight_save_row.addWidget(self._btn_load_flight)
         pl.addLayout(flight_save_row)
+
+        # ── Timeline container (ID-20, hidden until flight starts) ──
+        self._timeline_container = QtWidgets.QWidget()
+        tl = QtWidgets.QVBoxLayout(self._timeline_container)
+        tl.setContentsMargins(0, 0, 0, 0)
+
+        tl.addWidget(QtWidgets.QLabel("— 飞行时间轴 —"))
+
+        # Keyframe marker labels row
+        self._keyframe_widget = QtWidgets.QWidget()
+        self._kf_layout = QtWidgets.QHBoxLayout(self._keyframe_widget)
+        self._kf_layout.setContentsMargins(0, 0, 0, 0)
+        tl.addWidget(self._keyframe_widget)
+
+        # Time label
+        self._tl_time_label = QtWidgets.QLabel("0.0 / 0.0 秒")
+        tl.addWidget(self._tl_time_label)
+
+        # Slider
+        self._tl_slider = QtWidgets.QSlider(Qt.Horizontal)
+        self._tl_slider.setRange(0, 1000)
+        self._tl_slider.sliderPressed.connect(self._on_tl_pressed)
+        self._tl_slider.valueChanged.connect(self._on_tl_seek)
+        self._tl_slider.sliderReleased.connect(self._on_tl_released)
+        tl.addWidget(self._tl_slider)
+
+        pl.addWidget(self._timeline_container)
+        self._timeline_container.hide()
+
+        # ── Save state + Copy path buttons (ID-20) ──
+        action_row = QtWidgets.QHBoxLayout()
+        self._btn_save_state = QtWidgets.QPushButton("保存当前姿态")
+        self._btn_save_state.clicked.connect(self._save_current_state)
+        self._btn_save_state.setEnabled(False)
+        action_row.addWidget(self._btn_save_state)
+        self._btn_copy_path = QtWidgets.QPushButton("复制路径到...")
+        self._btn_copy_path.clicked.connect(self._copy_path_to_aircraft)
+        action_row.addWidget(self._btn_copy_path)
+        pl.addLayout(action_row)
 
         pl.addStretch()
         dock_path.setWidget(pw)
@@ -675,6 +788,118 @@ class MainWindow(QtWidgets.QMainWindow):
             return 0.0
         return s.value() / 1000.0
 
+    # ── Opacity slider factory (ID-18) ─────────────
+
+    @staticmethod
+    def _create_opacity_slider(initial_opacity, callback):
+        """Create an opacity slider (0% → 1.0 transparent, 100% → 1.0 opaque).
+
+        Returns ``(widget, setter_func)`` where *setter_func(v)* updates
+        the slider display without triggering *callback*.
+        """
+        w = QtWidgets.QWidget()
+        lo = QtWidgets.QHBoxLayout(w)
+        lo.setContentsMargins(0, 0, 0, 0)
+        s = QtWidgets.QSlider(Qt.Horizontal)
+        s.setRange(0, 100)
+        s.setValue(int(initial_opacity * 100))
+        label = QtWidgets.QLabel(f"{int(initial_opacity * 100)}%")
+        label.setMinimumWidth(35)
+        label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        lo.addWidget(s, 1)
+        lo.addWidget(label)
+
+        def on_change(val):
+            t = val  # t = 0..100, 0=opaque, 100=transparent
+            label.setText(f"{t}%透明")
+            # Convert transparency to opacity for the callback
+            opacity = (100 - t) / 100.0
+            callback(opacity)
+
+        def setter(val):
+            """Set opacity directly: val is opacity [0..1]."""
+            t = int((1.0 - val) * 100)  # Convert opacity → transparency
+            s.blockSignals(True)
+            s.setValue(t)
+            s.blockSignals(False)
+            label.setText(f"{t}%透明")
+
+        s.valueChanged.connect(on_change)
+        return w, setter
+
+    # ── Terrain layer controls (ID-18) ─────────────
+
+    def _toggle_terrain_layer(self, name, visible):
+        """Show / hide a terrain layer actor."""
+        info = self.scene_objects.get(name)
+        if info is None:
+            return
+        info["visible"] = visible
+        if visible:
+            self._rebuild_actor(name)
+        else:
+            self._remove_actor(name)
+        self.plotter.render()
+
+    def _on_terrain_opacity(self, name, value):
+        """Update a terrain layer's opacity and persist to scene_objects params."""
+        if name not in self.plotter_actors:
+            return
+        actor = self.plotter_actors[name]
+        vtk_actor = self._resolve_vtk_actor(actor)
+        vtk_actor.GetProperty().SetOpacity(value)
+        # Persist so rebuilds (toggle off/on) keep the user's setting
+        info = self.scene_objects.get(name)
+        if info is not None:
+            info["params"]["opacity"] = value
+        self.plotter.render()
+
+    def _refresh_terrain_ui(self):
+        """Sync terrain layer checkboxes & sliders with current scene state."""
+        for name, chk in self._terrain_chks.items():
+            info = self.scene_objects.get(name)
+            if info is not None:
+                chk.blockSignals(True)
+                chk.setChecked(info["visible"])
+                chk.blockSignals(False)
+        for name, setter in self._terrain_opacity_setters.items():
+            actor = self.plotter_actors.get(name)
+            if actor is not None:
+                vtk_actor = self._resolve_vtk_actor(actor)
+                op = vtk_actor.GetProperty().GetOpacity()
+                setter(op)
+
+    def _rebuild_terrain_layers(self):
+        """Re-create sand/grass/earth layer meshes from the terrain grid.
+
+        Called after terrain elevation data is loaded so the thresholded
+        layers reflect the new Z values.
+        """
+        terrain_info = self.scene_objects.get("terrain")
+        if terrain_info is None:
+            return
+        grid = terrain_info["mesh"]
+        extra = terrain_info.get("extra")
+        if extra is None:
+            return
+        Z = extra.get("original_z")
+        if Z is None:
+            return
+
+        for name in ["layer_sand", "layer_grass", "layer_earth"]:
+            self._remove_actor(name)
+            self.scene_objects.pop(name, None)
+
+        from src.scene_builder import build_terrain_layer_meshes
+        new_layers = build_terrain_layer_meshes(grid, Z)
+        for name, obj in new_layers.items():
+            self.scene_objects[name] = obj
+            if obj["visible"]:
+                self._add_actor(name, obj)
+
+        self._refresh_terrain_ui()
+        self.plotter.render()
+
 
     # ═══════════════════════════════════════════════════════════════
     #  Layer / tree panels
@@ -693,8 +918,11 @@ class MainWindow(QtWidgets.QMainWindow):
             cb.deleteLater()
         self._custom_chk.clear()
 
-        # ── Built-in scene objects ──
+        # ── Built-in scene objects (excl. terrain layers managed in 图层管理) ──
+        skip = {"terrain", "layer_sand", "layer_grass", "layer_earth", "vegetation"}
         for name in self.scene_objects:
+            if name in skip:
+                continue
             info = self.scene_objects[name]
             cb = QtWidgets.QCheckBox(name)
             cb.setChecked(info["visible"])
@@ -714,6 +942,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._populate_tree()
         self._refresh_obj_combo()
         self._refresh_flight_combo()
+        self._refresh_terrain_ui()
 
     def _toggle_layer(self, name, visible):
         """Show / hide a built-in scene object."""
@@ -1359,6 +1588,7 @@ class MainWindow(QtWidgets.QMainWindow):
             mesh.points = pts
             mesh["elevation"] = Z_2d.flatten(order="F")
             self._rebuild_actor("terrain")
+            self._rebuild_terrain_layers()
 
         # Restore transforms for ALL non-aircraft objects
         objects_data = terrain_data.get("objects", {})
@@ -1647,23 +1877,30 @@ class MainWindow(QtWidgets.QMainWindow):
             self._stop_flight()
             return
 
-        if len(self.waypoints) < 2:
-            self.statusBar().showMessage("路径点不足（至少需要 2 个点）", 3000)
-            return
-
         name = self._flight_aircraft_combo.currentText()
         if not name:
             self.statusBar().showMessage("请先选择一架飞机", 3000)
             return
 
+        # Get waypoints for this aircraft (ID-20: per-aircraft waypoints)
+        aircraft_wps = self._get_aircraft_waypoints(name)
+        if len(aircraft_wps) < 2:
+            self.statusBar().showMessage("路径点不足（至少需要 2 个点）", 3000)
+            return
+
+        # Ask about independent flight window (ID-20)
+        reply = QtWidgets.QMessageBox.question(
+            self, "飞行窗口",
+            "独立窗口观看飞行?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+        )
+        open_independent = (reply == QtWidgets.QMessageBox.Yes)
+
+        # Build flight path: start at waypoint[0], end at waypoint[-1] (ID-20)
+        path = [np.array(wp) for wp in aircraft_wps]
+
         # Ensure transform exists
         t = self._get_or_init_transform(name)
-
-        # Build flight path: start at current position, then through waypoints
-        start_pos = list(t["offset"])
-        path = [np.array(start_pos)]
-        for wp in self.waypoints:
-            path.append(np.array(wp))
 
         # ── Build segments with speed-aware step count ──
         segments = []
@@ -1680,7 +1917,7 @@ class MainWindow(QtWidgets.QMainWindow):
             horiz_dist = np.sqrt(dx * dx + dy * dy) + 1e-12
             dist = np.linalg.norm(p1 - p0) + 1e-12
 
-            yaw = math.degrees(math.atan2(dx, dy)) % 360.0
+            yaw = math.degrees(math.atan2(dy, dx)) % 360.0
             pitch = math.degrees(math.atan2(-dz, horiz_dist))
             pitch = max(-90.0, min(90.0, pitch))
 
@@ -1720,10 +1957,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 "steps": steps,
             })
 
+        # Pre-compute total time for timeline (ID-20)
+        total_steps = sum(seg["steps"] for seg in segments)
+        total_time_ms = total_steps * self.FLIGHT_INTERVAL_MS
+
+        # Teleport aircraft to waypoint[0] (ID-20)
+        t["offset"] = list(aircraft_wps[0])
+        self._apply_obj_transform_to_actor(name)
+
         cache = {
             "aircraft_name": name,
-            "start_position": start_pos,
-            "waypoints": [wp.tolist() for wp in self.waypoints],
+            "start_position": aircraft_wps[0],
+            "waypoints": [wp.tolist() for wp in aircraft_wps],
             "segments": segments,
             "interval_ms": self.FLIGHT_INTERVAL_MS,
         }
@@ -1735,16 +1980,33 @@ class MainWindow(QtWidgets.QMainWindow):
         self._flight_segments = segments
         self._flight_segment_idx = 0
         self._flight_step = 0
-        self._flight_steps_per_segment = segments[0]["steps"] if segments else 50
         self._flight_data_cache = cache
+
+        # Timeline state (ID-20)
+        self._total_flight_steps = total_steps
+        self._total_flight_time_ms = total_time_ms
+
+        self._tl_slider.setRange(0, total_time_ms)
+        self._tl_slider.setValue(0)
+        self._update_timeline_label(0)
+        self._setup_keyframe_labels(len(aircraft_wps))
+        self._timeline_container.show()
+        self._btn_save_state.setEnabled(True)
 
         self._btn_start_flight.setText("停止飞行")
         self._flight_aircraft_combo.setEnabled(False)
         self._btn_save_flight.setEnabled(False)
         self._btn_load_flight.setEnabled(False)
 
+        # Open independent window if requested (ID-20)
+        if open_independent:
+            self._open_flight_window(name)
+        else:
+            self._flight_window = None
+
+        self.plotter.render()
         self.statusBar().showMessage(
-            f"飞行开始: {name} → {len(self.waypoints)} 个路径点", 3000
+            f"飞行开始: {name} → {len(aircraft_wps)} 个路径点 ({total_time_ms/1000:.1f}s)", 3000
         )
         self._flight_timer.start(self.FLIGHT_INTERVAL_MS)
 
@@ -1754,6 +2016,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._flight_active = False
         self._flight_segment_idx = 0
         self._flight_step = 0
+
+        # Hide timeline (ID-20)
+        self._timeline_container.hide()
+        self._btn_save_state.setEnabled(False)
+
+        # Close independent flight window (ID-20)
+        if self._flight_window is not None:
+            try:
+                self._flight_window.close()
+            except Exception:
+                pass
+            self._flight_window = None
 
         self._btn_start_flight.setText("开始飞行")
         self._flight_aircraft_combo.setEnabled(True)
@@ -1804,6 +2078,77 @@ class MainWindow(QtWidgets.QMainWindow):
             d -= 360.0
         return (a + d * t) % 360.0
 
+    def _compute_flight_state_at(self, seg_idx, step):
+        """Compute aircraft position and attitude at (segment, step).
+
+        Returns a dict with ``pos`` (np.array), ``yaw``, ``pitch``, ``roll``,
+        or ``None`` if the segment index is out of range.
+        """
+        segments = self._flight_segments
+        if seg_idx >= len(segments):
+            return None
+
+        seg = segments[seg_idx]
+        steps = seg["steps"]
+        t_val = step / float(steps) if steps > 0 else 1.0
+        t_val = min(t_val, 1.0)
+
+        pos = self._catmull_rom_position(self._flight_path, seg_idx, t_val)
+
+        entry_yaw = float(seg["yaw"])
+        if seg_idx + 1 < len(segments):
+            exit_yaw = float(segments[seg_idx + 1]["yaw"])
+        else:
+            exit_yaw = entry_yaw
+        yaw = self._lerp_angle(entry_yaw, exit_yaw, t_val)
+
+        entry_pitch = float(seg["pitch"])
+        if seg_idx + 1 < len(segments):
+            exit_pitch = float(segments[seg_idx + 1]["pitch"])
+        else:
+            exit_pitch = entry_pitch
+        pitch = entry_pitch + (exit_pitch - entry_pitch) * t_val
+        pitch = max(-90.0, min(90.0, pitch))
+
+        roll = 0.0
+
+        return {"pos": pos, "yaw": yaw, "pitch": pitch, "roll": roll}
+
+    def _apply_flight_state(self, state):
+        """Apply a flight state dict to the aircraft actor(s) + UI sliders."""
+        if state is None:
+            return
+        name = self._flight_aircraft
+        pos = state["pos"]
+        yaw = state["yaw"]
+        pitch = state["pitch"]
+        roll = state["roll"]
+
+        # Update transform
+        if name in self._obj_transforms:
+            self._obj_transforms[name]["offset"] = pos.tolist()
+            self._obj_transforms[name]["yaw"] = yaw
+            self._obj_transforms[name]["pitch"] = pitch
+            self._obj_transforms[name]["roll"] = roll
+
+        # Update UI sliders (block signals to avoid double-trigger)
+        self._set_slider_value(self._slider_obj_x, pos[0])
+        self._set_slider_value(self._slider_obj_y, pos[1])
+        self._set_slider_value(self._slider_obj_z, pos[2])
+        self._set_slider_value(self._slider_obj_yaw, yaw)
+        self._set_slider_value(self._slider_obj_pitch, pitch)
+        self._set_slider_value(self._slider_obj_roll, roll)
+
+        # Apply to VTK actor on main window
+        self._apply_obj_transform_to_actor(name)
+
+        # Update independent flight window if open (ID-20)
+        if self._flight_window is not None:
+            self._flight_window.update_position(name)
+            self._flight_window.update_timeline(
+                self._tl_slider.value(), self._total_flight_time_ms
+            )
+
     def _flight_tick(self):
         """Single animation step called by the flight timer."""
         if not self._flight_active:
@@ -1821,50 +2166,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
 
             seg = segments[seg_idx]
-            steps = seg["steps"]
-            t = step / float(steps) if steps > 0 else 1.0
-            t = min(t, 1.0)
+            steps_in_seg = seg["steps"]
 
-            pos = self._catmull_rom_position(self._flight_path, seg_idx, t)
+            state = self._compute_flight_state_at(seg_idx, step)
+            self._apply_flight_state(state)
 
-            entry_yaw = float(seg["yaw"])
-            if seg_idx + 1 < len(segments):
-                exit_yaw = float(segments[seg_idx + 1]["yaw"])
-            else:
-                exit_yaw = entry_yaw
-            yaw = self._lerp_angle(entry_yaw, exit_yaw, t)
-
-            entry_pitch = float(seg["pitch"])
-            if seg_idx + 1 < len(segments):
-                exit_pitch = float(segments[seg_idx + 1]["pitch"])
-            else:
-                exit_pitch = entry_pitch
-            pitch = entry_pitch + (exit_pitch - entry_pitch) * t
-            pitch = max(-90.0, min(90.0, pitch))
-
-            roll = 0.0
-
-            # Update transform
-            if name in self._obj_transforms:
-                self._obj_transforms[name]["offset"] = pos.tolist()
-                self._obj_transforms[name]["yaw"] = yaw
-                self._obj_transforms[name]["pitch"] = pitch
-                self._obj_transforms[name]["roll"] = roll
-
-            # Update UI sliders (block signals to avoid double-trigger)
-            self._set_slider_value(self._slider_obj_x, pos[0])
-            self._set_slider_value(self._slider_obj_y, pos[1])
-            self._set_slider_value(self._slider_obj_z, pos[2])
-            self._set_slider_value(self._slider_obj_yaw, yaw)
-            self._set_slider_value(self._slider_obj_pitch, pitch)
-            self._set_slider_value(self._slider_obj_roll, roll)
-
-            # Apply to VTK actor
-            self._apply_obj_transform_to_actor(name)
+            # Update timeline (ID-20)
+            self._update_timeline()
 
             # Advance step / segment
             self._flight_step += 1
-            if self._flight_step >= steps:
+            if self._flight_step >= steps_in_seg:
                 self._flight_segment_idx += 1
                 self._flight_step = 0
         except Exception as e:
@@ -2008,6 +2320,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_obj_transform_to_actor(name)
         self.plotter.render()
 
+        # Pre-compute total time for timeline (ID-20)
+        total_steps = sum(seg["steps"] for seg in segments)
+        total_time_ms = total_steps * interval_ms
+
         self._flight_active = True
         self._flight_aircraft = name
         self._flight_path = [np.array(p) for p in [start_pos] + saved_wps]
@@ -2016,6 +2332,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._flight_step = 0
         self._flight_steps_per_segment = segments[0].get("steps", 50)
         self._flight_data_cache = data
+
+        # Timeline state (ID-20)
+        self._total_flight_steps = total_steps
+        self._total_flight_time_ms = total_time_ms
+
+        self._tl_slider.setRange(0, total_time_ms)
+        self._tl_slider.setValue(0)
+        self._update_timeline_label(0)
+        num_wp = len(saved_wps) + 1  # +1 for start position
+        self._setup_keyframe_labels(num_wp)
+        self._timeline_container.show()
+        self._btn_save_state.setEnabled(True)
 
         self._btn_start_flight.setText("停止飞行")
         self._flight_aircraft_combo.setEnabled(False)
@@ -2027,6 +2355,160 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._flight_timer.start(interval_ms)
 
+
+    # ═══════════════════════════════════════════════════════════════
+    #  ID-20: Timeline / seek / per-aircraft waypoints
+    # ═══════════════════════════════════════════════════════════════
+
+    def _get_aircraft_waypoints(self, name):
+        """Return waypoint list for *name* (per-aircraft or global fallback)."""
+        if name in self._aircraft_waypoints and self._aircraft_waypoints[name]:
+            return self._aircraft_waypoints[name]
+        return self.waypoints
+
+    def _setup_keyframe_labels(self, num_wp):
+        """Place keyframe markers (⬤1 ⬤2 …) above the timeline slider."""
+        while self._kf_layout.count():
+            item = self._kf_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        for i in range(num_wp):
+            lbl = QtWidgets.QLabel(f"\u2b24 {i+1}")
+            lbl.setStyleSheet("color: #cc3333; font-size: 9px;")
+            self._kf_layout.addWidget(lbl)
+        self._kf_layout.addStretch()
+
+    def _update_timeline(self):
+        """Sync the timeline slider with current flight progress."""
+        accum = 0
+        for i in range(self._flight_segment_idx):
+            accum += self._flight_segments[i]["steps"]
+        accum += self._flight_step
+
+        current_ms = 0
+        if self._total_flight_steps > 0:
+            progress = accum / self._total_flight_steps
+            current_ms = int(progress * self._total_flight_time_ms)
+
+        self._tl_slider.blockSignals(True)
+        self._tl_slider.setValue(current_ms)
+        self._tl_slider.blockSignals(False)
+        self._update_timeline_label(current_ms)
+
+        if self._flight_window is not None:
+            self._flight_window.update_timeline(current_ms, self._total_flight_time_ms)
+
+    def _update_timeline_label(self, current_ms=None):
+        """Update the time label showing current / total seconds."""
+        if current_ms is None:
+            current_ms = self._tl_slider.value()
+        current_s = current_ms / 1000.0
+        total_s = self._total_flight_time_ms / 1000.0
+        self._tl_time_label.setText(f"{current_s:.1f} / {total_s:.1f} 秒")
+
+    # ── Timeline seek handlers ──────────────────────────────
+
+    def _on_tl_pressed(self):
+        """Pause the flight timer while the user drags the timeline."""
+        if self._flight_timer.isActive():
+            self._flight_timer.stop()
+
+    def _on_tl_seek(self, value_ms):
+        """Seek to a specific time position (value in ms) during slider drag."""
+        if not self._flight_active or not self._flight_segments:
+            return
+        total_ms = self._total_flight_time_ms
+        if total_ms <= 0:
+            return
+
+        progress = value_ms / total_ms
+        target_step = int(progress * self._total_flight_steps)
+        target_step = max(0, min(self._total_flight_steps - 1, target_step))
+
+        # Find segment and step
+        accum = 0
+        for seg_idx, seg in enumerate(self._flight_segments):
+            if accum + seg["steps"] > target_step:
+                self._flight_segment_idx = seg_idx
+                self._flight_step = target_step - accum
+                break
+            accum += seg["steps"]
+
+        # Update slider value before apply so _flight_window reads correct time
+        self._tl_slider.blockSignals(True)
+        self._tl_slider.setValue(value_ms)
+        self._tl_slider.blockSignals(False)
+
+        state = self._compute_flight_state_at(
+            self._flight_segment_idx, self._flight_step
+        )
+        self._apply_flight_state(state)
+        self._update_timeline_label(value_ms)
+
+    def _on_tl_released(self):
+        """Resume the flight timer after the user releases the slider."""
+        if self._flight_active:
+            self._flight_timer.start(self.FLIGHT_INTERVAL_MS)
+
+    # ── Save current state (ID-20) ─────────────────────────
+
+    def _save_current_state(self):
+        """Save current aircraft position + attitude + timestamp."""
+        if not self._flight_active:
+            return
+        name = self._flight_aircraft
+        if name not in self._obj_transforms:
+            return
+        t = self._obj_transforms[name]
+        current_ms = self._tl_slider.value()
+        state = {
+            "offset": list(t["offset"]),
+            "yaw": float(t.get("yaw", 0.0)),
+            "pitch": float(t.get("pitch", 0.0)),
+            "roll": float(t.get("roll", 0.0)),
+            "time_ms": current_ms,
+        }
+        self._saved_flight_states.append(state)
+        self.statusBar().showMessage(
+            f"已保存姿态 #{len(self._saved_flight_states)}  (t={current_ms/1000:.1f}s)", 3000
+        )
+
+    # ── Copy path to another aircraft (ID-20) ──────────────
+
+    def _copy_path_to_aircraft(self):
+        """Copy current global waypoints to a selected aircraft."""
+        if not self.waypoints:
+            self.statusBar().showMessage("没有路径点可复制", 3000)
+            return
+
+        names = sorted(
+            n for n in self.scene_objects if "aircraft" in n.lower()
+        )
+        if not names:
+            self.statusBar().showMessage("场景中没有飞机", 3000)
+            return
+
+        item, ok = QtWidgets.QInputDialog.getItem(
+            self, "复制路径到", "选择要接收路径的飞机:", names, False
+        )
+        if ok and item:
+            self._aircraft_waypoints[item] = [list(wp) for wp in self.waypoints]
+            self.statusBar().showMessage(f"路径已复制到 {item}", 3000)
+
+    # ── Independent flight window (ID-20) ──────────────────
+
+    def _open_flight_window(self, name):
+        """Open an independent FlightWindow for immersive viewing."""
+        mesh_data = self.scene_objects.get(name)
+        if mesh_data is None:
+            return
+        self._flight_window = FlightWindow(self, name, mesh_data["mesh"], mesh_data["params"])
+        self._flight_window.finished.connect(self._on_flight_window_closed)
+        self._flight_window.show()
+
+    def _on_flight_window_closed(self):
+        """Clean up when the independent flight window is closed."""
+        self._flight_window = None
 
     # ═══════════════════════════════════════════════════════════════
     #  Collision detection
@@ -2228,6 +2710,134 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
 
+class FlightWindow(QtWidgets.QDialog):
+    """Independent window with its own 3D viewport for immersive flight viewing.
+
+    Shows the aircraft against terrain context and follows it with the camera.
+    """
+
+    def __init__(self, parent, aircraft_name, mesh, params):
+        super().__init__(parent)
+        self.aircraft_name = aircraft_name
+        self.main_win = parent
+        self.setWindowTitle("飞行动画 - 独立窗口")
+        self.resize(1280, 800)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # Renderer — create, defer actual render to _init_view()
+        self.plotter = ClickablePlotter(self)
+        self.plotter.background_color = "#1a1a2e"
+        layout.addWidget(self.plotter)
+
+        # Add terrain for spatial context (extract surface to avoid
+        # StructuredGrid issues in secondary renderers)
+        terrain_info = parent.scene_objects.get("terrain")
+        if terrain_info:
+            try:
+                t_mesh = terrain_info["mesh"]
+                if hasattr(t_mesh, "extract_surface"):
+                    t_mesh = t_mesh.extract_surface()
+                tp = dict(terrain_info["params"])
+                tp.pop("scalars", None)
+                tp.pop("cmap", None)
+                tp.pop("clim", None)
+                self.plotter.add_mesh(t_mesh, **tp)
+            except Exception:
+                pass
+
+        # Add aircraft (fresh actor for this renderer)
+        self.fw_actor = None
+        try:
+            self.fw_actor = self.plotter.add_mesh(mesh, **params)
+        except Exception as e:
+            print(f"[FlightWindow] add_mesh failed: {e}")
+
+        # Lighting
+        try:
+            light1 = pv.Light(position=(10, -10, 15), intensity=0.8)
+            light2 = pv.Light(position=(-5, 5, 8), intensity=0.4)
+            self.plotter.add_light(light1)
+            self.plotter.add_light(light2)
+        except Exception:
+            pass
+
+        self.plotter.camera_position = [(18, -16, 8), (0, 0, 2), (0, 0, 1)]
+
+        # Defer the first render to after the widget is mapped (avoids
+        # OpenGL context crash with secondary QVTK windows).
+        QtCore.QTimer.singleShot(50, self._init_view)
+
+    def _init_view(self):
+        """Deferred initial render — called once after the window is mapped."""
+        try:
+            self.plotter.render()
+        except Exception as e:
+            print(f"[FlightWindow] init render: {e}")
+
+    def update_position(self, name):
+        """Copy the main-window aircraft transform to this window's actor."""
+        if self.fw_actor is None:
+            return
+        if name not in self.main_win._obj_transforms:
+            return
+        t = self.main_win._obj_transforms[name]
+        vtk_actor = self.fw_actor.actor
+
+        offset = np.array(t["offset"], dtype=float)
+        orig_center = np.array(t.get("orig_center", offset), dtype=float)
+        s = float(t["scale"])
+        yaw = float(t.get("yaw", 0.0))
+        pitch = float(t.get("pitch", 0.0))
+        roll = float(t.get("roll", 0.0))
+
+        yaw_r = np.radians(yaw)
+        pitch_r = np.radians(pitch)
+        roll_r = np.radians(roll)
+
+        Rx = np.array([
+            [1, 0, 0],
+            [0, np.cos(roll_r), -np.sin(roll_r)],
+            [0, np.sin(roll_r), np.cos(roll_r)],
+        ])
+        Ry = np.array([
+            [np.cos(pitch_r), 0, np.sin(pitch_r)],
+            [0, 1, 0],
+            [-np.sin(pitch_r), 0, np.cos(pitch_r)],
+        ])
+        Rz = np.array([
+            [np.cos(yaw_r), -np.sin(yaw_r), 0],
+            [np.sin(yaw_r), np.cos(yaw_r), 0],
+            [0, 0, 1],
+        ])
+        R = Rz @ Ry @ Rx
+
+        H = np.eye(4)
+        H[:3, :3] = R * s
+        H[:3, 3] = offset - (R * s) @ orig_center
+
+        vtk_matrix = vtk.vtkMatrix4x4()
+        for i in range(4):
+            for j in range(4):
+                vtk_matrix.SetElement(i, j, float(H[i, j]))
+
+        transform = vtk.vtkTransform()
+        transform.SetMatrix(vtk_matrix)
+        vtk_actor.SetUserTransform(transform)
+
+        # Follow aircraft with camera
+        fp = offset.copy()
+        fp[2] = fp[2] + 2.0
+        self.plotter.camera.focal_point = fp
+        self.plotter.render()
+
+    def update_timeline(self, current_ms, total_ms):
+        """Synced timeline display (pass-through, no seek control here)."""
+        pass
+
+
 class WaypointPreciseDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2271,6 +2881,15 @@ class WaypointPreciseDialog(QtWidgets.QDialog):
         self._canvas_xy = FigureCanvasQTAgg(self._fig_xy)
         self._canvas_xy.mpl_connect("button_press_event", self._on_xy_click)
         layout.addWidget(self._canvas_xy)
+
+        # ── Coordinate list table (ID-19) ──
+        self._point_table = QtWidgets.QTableWidget()
+        self._point_table.setColumnCount(4)
+        self._point_table.setHorizontalHeaderLabels(["点", "X", "Y", "操作"])
+        self._point_table.horizontalHeader().setStretchLastSection(True)
+        self._point_table.setMaximumHeight(150)
+        self._point_table.setAlternatingRowColors(True)
+        layout.addWidget(self._point_table)
 
         spin_layout = QtWidgets.QHBoxLayout()
         self._spin_x = QtWidgets.QDoubleSpinBox()
@@ -2337,6 +2956,18 @@ class WaypointPreciseDialog(QtWidgets.QDialog):
         self._spin_z.valueChanged.connect(self._on_z_spin_changed)
         layout.addWidget(self._spin_z)
 
+        # Z height slider for precise control (ID-19)
+        z_slider_layout = QtWidgets.QHBoxLayout()
+        z_slider_layout.addWidget(QtWidgets.QLabel("Z 高度:"))
+        self._z_slider = QtWidgets.QSlider(Qt.Horizontal)
+        self._z_slider.setRange(0, 1000)
+        self._z_slider.valueChanged.connect(self._on_z_slider_changed)
+        self._z_slider_label = QtWidgets.QLabel("0.00")
+        self._z_slider_label.setMinimumWidth(50)
+        z_slider_layout.addWidget(self._z_slider, 1)
+        z_slider_layout.addWidget(self._z_slider_label)
+        layout.addLayout(z_slider_layout)
+
         btn_layout = QtWidgets.QHBoxLayout()
         btn_prev = QtWidgets.QPushButton("上一步")
         btn_prev.clicked.connect(lambda: self._stack.setCurrentIndex(0))
@@ -2383,6 +3014,7 @@ class WaypointPreciseDialog(QtWidgets.QDialog):
         self._spin_x.blockSignals(block_x)
         self._spin_y.blockSignals(block_y)
         self._redraw_xy()
+        self._update_table()
         self._btn_undo.setEnabled(True)
         self._btn_next.setEnabled(len(self._points) >= 2)
 
@@ -2393,12 +3025,18 @@ class WaypointPreciseDialog(QtWidgets.QDialog):
         self._points[idx] = [round(self._spin_x.value(), 2),
                              round(self._spin_y.value(), 2)]
         self._redraw_xy()
+        self._update_table()
 
     def _undo_last_point(self):
         if not self._points:
             return
         self._points.pop()
+        if self._z_values and len(self._z_values) > len(self._points):
+            self._z_values.pop()
+        if self._selected_z_idx >= len(self._z_values):
+            self._selected_z_idx = max(0, len(self._z_values) - 1)
         self._redraw_xy()
+        self._update_table()
         self._btn_undo.setEnabled(bool(self._points))
         self._btn_next.setEnabled(len(self._points) >= 2)
         if self._points:
@@ -2408,7 +3046,39 @@ class WaypointPreciseDialog(QtWidgets.QDialog):
             self._spin_y.setValue(self._points[-1][1])
             self._spin_x.blockSignals(block_x)
             self._spin_y.blockSignals(block_y)
-    
+
+    def _update_table(self):
+        """Refresh the point-list table from self._points."""
+        self._point_table.setRowCount(len(self._points))
+        for i, (x, y) in enumerate(self._points):
+            lbl = self._label_for(i)
+            item_id = QtWidgets.QTableWidgetItem(lbl)
+            item_id.setFlags(item_id.flags() & ~Qt.ItemIsEditable)
+            self._point_table.setItem(i, 0, item_id)
+            item_x = QtWidgets.QTableWidgetItem(f"{x:.2f}")
+            item_x.setFlags(item_x.flags() & ~Qt.ItemIsEditable)
+            self._point_table.setItem(i, 1, item_x)
+            item_y = QtWidgets.QTableWidgetItem(f"{y:.2f}")
+            item_y.setFlags(item_y.flags() & ~Qt.ItemIsEditable)
+            self._point_table.setItem(i, 2, item_y)
+            btn_del = QtWidgets.QPushButton("删除")
+            btn_del.clicked.connect(lambda checked, idx=i: self._delete_point(idx))
+            self._point_table.setCellWidget(i, 3, btn_del)
+
+    def _delete_point(self, idx):
+        """Remove a point by index and re-number the remainder."""
+        if idx < 0 or idx >= len(self._points):
+            return
+        self._points.pop(idx)
+        if idx < len(self._z_values):
+            self._z_values.pop(idx)
+        if self._selected_z_idx >= len(self._z_values):
+            self._selected_z_idx = max(0, len(self._z_values) - 1)
+        self._redraw_xy()
+        self._update_table()
+        self._btn_undo.setEnabled(bool(self._points))
+        self._btn_next.setEnabled(len(self._points) >= 2)
+
     def _compute_cumulative_distances(self):
         if len(self._points) < 2:
             return [0.0]
@@ -2422,8 +3092,10 @@ class WaypointPreciseDialog(QtWidgets.QDialog):
     def _go_step2(self):
         if len(self._points) < 2:
             return
-        self._z_values = [0.0] * len(self._points)
-        self._selected_z_idx = 0
+        if len(self._z_values) != len(self._points):
+            self._z_values = [0.0] * len(self._points)
+        if self._selected_z_idx >= len(self._z_values):
+            self._selected_z_idx = 0
         self._stack.setCurrentIndex(1)
         self._redraw_z()
 
@@ -2460,9 +3132,16 @@ class WaypointPreciseDialog(QtWidgets.QDialog):
 
         sel_label = self._label_for(self._selected_z_idx)
         self._lbl_point_info.setText(f"当前点: {sel_label}, 距离: {sel_x:.2f}")
+        z_val = self._z_values[self._selected_z_idx]
         block = self._spin_z.blockSignals(True)
-        self._spin_z.setValue(self._z_values[self._selected_z_idx])
+        self._spin_z.setValue(z_val)
         self._spin_z.blockSignals(block)
+        z_min, z_max = -20, 20
+        frac = (z_val - z_min) / (z_max - z_min)
+        block_slider = self._z_slider.blockSignals(True)
+        self._z_slider.setValue(int(frac * 1000))
+        self._z_slider_label.setText(f"{z_val:.2f}")
+        self._z_slider.blockSignals(block_slider)
 
         self._canvas_z.draw_idle()
 
@@ -2472,13 +3151,43 @@ class WaypointPreciseDialog(QtWidgets.QDialog):
         cum_dists = self._compute_cumulative_distances()
         idx = min(range(len(cum_dists)), key=lambda i: abs(cum_dists[i] - event.xdata))
         self._selected_z_idx = idx
-        self._z_values[idx] = round(event.ydata, 2)
+        z_val = round(max(-20.0, min(20.0, event.ydata)), 2)
+        self._z_values[idx] = z_val
+        block = self._spin_z.blockSignals(True)
+        self._spin_z.setValue(z_val)
+        self._spin_z.blockSignals(block)
+        z_min, z_max = -20, 20
+        frac = (z_val - z_min) / (z_max - z_min)
+        block_sl = self._z_slider.blockSignals(True)
+        self._z_slider.setValue(int(frac * 1000))
+        self._z_slider_label.setText(f"{z_val:.2f}")
+        self._z_slider.blockSignals(block_sl)
+        self._redraw_z()
+
+    def _on_z_slider_changed(self, value):
+        if not self._z_values or self._selected_z_idx >= len(self._z_values):
+            return
+        z_min, z_max = -20, 20
+        frac = value / 1000.0
+        z_val = round(z_min + frac * (z_max - z_min), 2)
+        self._z_values[self._selected_z_idx] = z_val
+        self._z_slider_label.setText(f"{z_val:.2f}")
+        block = self._spin_z.blockSignals(True)
+        self._spin_z.setValue(z_val)
+        self._spin_z.blockSignals(block)
         self._redraw_z()
 
     def _on_z_spin_changed(self):
         if not self._z_values or self._selected_z_idx >= len(self._z_values):
             return
-        self._z_values[self._selected_z_idx] = round(self._spin_z.value(), 2)
+        z_val = round(self._spin_z.value(), 2)
+        self._z_values[self._selected_z_idx] = z_val
+        z_min, z_max = -20, 20
+        frac = (z_val - z_min) / (z_max - z_min)
+        block = self._z_slider.blockSignals(True)
+        self._z_slider.setValue(int(frac * 1000))
+        self._z_slider_label.setText(f"{z_val:.2f}")
+        self._z_slider.blockSignals(block)
         self._redraw_z()
 
     def get_coords(self):

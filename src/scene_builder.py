@@ -52,14 +52,20 @@ def build_default_scene():
     grid = pv.StructuredGrid(X, Y, Z)
     grid["elevation"] = Z.flatten(order="F")
 
+    # ── Base terrain — flat light-yellow foundation ──
+    # Always visible. Uses a uniform colour (no elevation scalar mapping).
+    # Thresholded overlay layers (sand/grass/earth) sit on top with
+    # independent opacity control; when an overlay is transparent the
+    # base colour shows through.
+    z_min, z_max = float(Z.min()), float(Z.max())
     actors["terrain"] = {
         "mesh": grid,
         "type": "mesh",
         "visible": True,
         "params": {
-            "scalars": "elevation",
-            "cmap": "terrain",
+            "color": "#f2e2a8",
             "smooth_shading": True,
+            "opacity": 1.0,
         },
         "extra": {
             "original_z": Z.copy(),
@@ -68,6 +74,10 @@ def build_default_scene():
         },
         "name": "terrain",
     }
+
+    # ── Overlay layers (ID-18): sand/grass/earth on top of base terrain ──
+    for name, obj in build_terrain_layer_meshes(grid, Z).items():
+        actors[name] = obj
 
     # ──────────────────────────────────────────────
     #  2.  River  (flat surface following a sine path)
@@ -274,3 +284,93 @@ def build_default_scene():
     }
 
     return actors
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Terrain layer meshes (ID-18)
+# ═══════════════════════════════════════════════════════════════
+
+def build_terrain_layer_meshes(grid, Z):
+    """Create 3 elevation-thresholded terrain layers (sand/grass/earth).
+
+    Each layer is extracted from *grid* surface by thresholding the
+    ``"elevation"`` scalar.  The returned dict has the same shape as a
+    ``build_default_scene`` entry and is typically merged into the actors
+    dict::
+
+        actors["layer_sand"]   — 低处沙地  (yellow gradient)
+        actors["layer_grass"]  — 中部草地  (green gradient)
+        actors["layer_earth"]  — 高处土地  (brown gradient)
+    """
+    surface = grid.extract_surface()
+    z_min, z_max = float(Z.min()), float(Z.max())
+    elev_range = z_max - z_min
+
+    # Elevation thresholds for 3 bands — mountain tops (top ~25%) have NO overlay
+    sand_max = z_min + elev_range * 0.20
+    grass_max = z_min + elev_range * 0.45
+    earth_max = z_min + elev_range * 0.70
+
+    # Slight overlap to prevent visible gaps at band boundaries
+    eps = 0.02
+
+    sand_mesh = surface.threshold(
+        [z_min - 1.0, sand_max + eps],
+        scalars="elevation",
+        preference="point",
+    )
+    grass_mesh = surface.threshold(
+        [sand_max - eps, grass_max + eps],
+        scalars="elevation",
+        preference="point",
+    )
+    earth_mesh = surface.threshold(
+        [grass_max - eps, earth_max + eps],
+        scalars="elevation",
+        preference="point",
+    )
+
+    return {
+        "layer_sand": {
+            "mesh": sand_mesh,
+            "type": "mesh",
+            "visible": True,
+            "params": {
+                "scalars": "elevation",
+                "cmap": ["#f5e6b8", "#e8c76a", "#d4a843"],
+                "clim": [z_min, sand_max],
+                "smooth_shading": True,
+                "opacity": 1.0,
+            },
+            "extra": None,
+            "name": "layer_sand",
+        },
+        "layer_grass": {
+            "mesh": grass_mesh,
+            "type": "mesh",
+            "visible": True,
+            "params": {
+                "scalars": "elevation",
+                "cmap": ["#a8d5a2", "#5a9e4c", "#2d6b28"],
+                "clim": [sand_max, grass_max],
+                "smooth_shading": True,
+                "opacity": 1.0,
+            },
+            "extra": None,
+            "name": "layer_grass",
+        },
+        "layer_earth": {
+            "mesh": earth_mesh,
+            "type": "mesh",
+            "visible": True,
+            "params": {
+                "scalars": "elevation",
+                "cmap": ["#d4b896", "#8b6f47", "#5c4033"],
+                "clim": [grass_max, earth_max],
+                "smooth_shading": True,
+                "opacity": 1.0,
+            },
+            "extra": None,
+            "name": "layer_earth",
+        },
+    }
