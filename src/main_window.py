@@ -81,6 +81,42 @@ class ClickablePlotter(pvqt.QtInteractor):
         self.click_callback = None      # f(x, y, world_pos, vtkActor)
         self.move_callback = None       # f(x, y, world_pos)
 
+
+class FlightPlotter(ClickablePlotter):
+    """``ClickablePlotter`` variant that defers all VTK operations until shown.
+
+    macOS VTK crashes when a second ``QVTKRenderWindowInteractor`` is
+    created in the same process — the secondary OpenGL context conflicts
+    with the first.  This subclass suppresses the implicit ``render()``
+    calls that ``QtInteractor.__init__`` and every ``add_mesh`` perform,
+    then triggers the first real render from ``showEvent``.
+    """
+
+    def __init__(self, parent=None):
+        self._flight_ready = False
+        super().__init__(parent)
+        # Use offscreen rendering for the secondary render window to avoid
+        # OpenGL context conflicts with the main window.
+        self.render_window.SetOffScreenRendering(1)
+
+    def render(self, *args, **kwargs):
+        if not self._flight_ready:
+            return
+        super().render(*args, **kwargs)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._flight_ready:
+            self._flight_ready = True
+            QtCore.QTimer.singleShot(0, self._first_render)
+
+    def _first_render(self):
+        """First real render — called once after the window is mapped."""
+        try:
+            super().render()
+        except Exception as e:
+            print(f"[FlightPlotter] first render: {e}")
+
     def _to_vtk_display(self, qt_x, qt_y):
         """Convert Qt widget coords → VTK display coords (pixels, bottom-left origin).
 
@@ -540,7 +576,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._terrain_chks[layer_key] = chk
 
             slider_w, slider_setter = self._create_opacity_slider(
-                1.0,
+                0.0,
                 lambda val, n=layer_key: self._on_terrain_opacity(n, val),
             )
             row.addWidget(slider_w)
@@ -567,29 +603,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_precise_wp = QtWidgets.QPushButton("精准添加路径点")
         self._btn_precise_wp.clicked.connect(self._open_precise_wp_dialog)
         pl.addWidget(self._btn_precise_wp)
-
-        # Coordinate input row
-        coord_row = QtWidgets.QHBoxLayout()
-        self._wp_x = QtWidgets.QDoubleSpinBox()
-        self._wp_x.setRange(-20, 20)
-        self._wp_x.setDecimals(2)
-        self._wp_x.setPrefix("X: ")
-        self._wp_y = QtWidgets.QDoubleSpinBox()
-        self._wp_y.setRange(-20, 20)
-        self._wp_y.setDecimals(2)
-        self._wp_y.setPrefix("Y: ")
-        self._wp_z = QtWidgets.QDoubleSpinBox()
-        self._wp_z.setRange(-20, 20)
-        self._wp_z.setDecimals(2)
-        self._wp_z.setPrefix("Z: ")
-        coord_row.addWidget(self._wp_x)
-        coord_row.addWidget(self._wp_y)
-        coord_row.addWidget(self._wp_z)
-        pl.addLayout(coord_row)
-
-        btn_add_coord = QtWidgets.QPushButton("添加坐标路径点")
-        btn_add_coord.clicked.connect(self._add_wp_from_coords)
-        pl.addWidget(btn_add_coord)
 
         pl.addWidget(QtWidgets.QLabel("— 路径操作 —"))
         self._btn_clear_wp = QtWidgets.QPushButton("清除路径")
@@ -647,7 +660,6 @@ class MainWindow(QtWidgets.QMainWindow):
         tl.addWidget(self._tl_slider)
 
         pl.addWidget(self._timeline_container)
-        self._timeline_container.hide()
 
         # ── Copy path button (ID-20) ──
         self._btn_copy_path = QtWidgets.QPushButton("复制路径到...")
@@ -1243,15 +1255,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_coord_system(self, cs):
         self.coord_system = cs
         self.config["coordinate_system"] = cs
-        axes = COORD_SYSTEMS[cs]
-        # Update spinbox prefixes with meaningful axis labels (ID-3)
-        # axes format: "X: 东 (East)" → extract "东"
-        labels = [a.split(":")[1].strip().split(" ")[0] for a in axes["axes"]]
-        self._wp_x.setPrefix(f"{labels[0]}: ")
-        self._wp_y.setPrefix(f"{labels[1]}: ")
-        self._wp_z.setPrefix(f"{labels[2]}: ")
         self.statusBar().showMessage(
-            f"坐标系: {cs} ({axes['label']})  ", 3000
+            f"坐标系: {cs}  ", 3000
         )
         self._update_info()
 
@@ -1637,13 +1642,6 @@ class MainWindow(QtWidgets.QMainWindow):
             3000,
         )
 
-    def _add_wp_from_coords(self):
-        """Add a waypoint from the coordinate input fields."""
-        x = self._wp_x.value()
-        y = self._wp_y.value()
-        z = self._wp_z.value()
-        self._add_waypoint(np.array([x, y, z]))
-
     def _open_precise_wp_dialog(self):
         if not _HAS_MPL:
             QtWidgets.QMessageBox.warning(
@@ -1835,7 +1833,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._tl_slider.setValue(0)
         self._update_timeline_label(0)
         self._setup_keyframe_labels(len(aircraft_wps))
-        self._timeline_container.show()
         self._btn_start_flight.setText("停止飞行")
         self._flight_aircraft_combo.setEnabled(False)
         self._btn_save_flight.setEnabled(False)
@@ -1859,9 +1856,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._flight_active = False
         self._flight_segment_idx = 0
         self._flight_step = 0
-
-        # Hide timeline (ID-20)
-        self._timeline_container.hide()
 
         # Close independent flight window (ID-20)
         if self._flight_window is not None:
@@ -2184,7 +2178,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_timeline_label(0)
         num_wp = len(saved_wps) + 1  # +1 for start position
         self._setup_keyframe_labels(num_wp)
-        self._timeline_container.show()
         self._btn_start_flight.setText("停止飞行")
         self._flight_aircraft_combo.setEnabled(False)
         self._btn_save_flight.setEnabled(False)
@@ -2548,8 +2541,10 @@ class FlightWindow(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        # Renderer — create (first render deferred to showEvent)
-        self.plotter = ClickablePlotter(self)
+        # Renderer — use FlightPlotter which defers all VTK operations
+        # until the widget is mapped, avoiding macOS OpenGL context crashes
+        # with secondary QVTK windows.
+        self.plotter = FlightPlotter(self)
         self.plotter.background_color = "#1a1a2e"
         layout.addWidget(self.plotter)
 
@@ -2586,22 +2581,6 @@ class FlightWindow(QtWidgets.QDialog):
             pass
 
         self.plotter.camera_position = [(18, -16, 8), (0, 0, 2), (0, 0, 1)]
-        self._rendered_once = False
-
-    def showEvent(self, event):
-        """Defer first render until the widget has a valid OpenGL context."""
-        super().showEvent(event)
-        if not self._rendered_once:
-            self._rendered_once = True
-            # Must schedule after showEvent returns so the window is mapped.
-            QtCore.QTimer.singleShot(0, self._flush_init)
-
-    def _flush_init(self):
-        """First render — runs once after the window is mapped."""
-        try:
-            self.plotter.render()
-        except Exception as e:
-            print(f"[FlightWindow] init render: {e}")
 
     def update_position(self, name):
         """Copy the main-window aircraft transform to this window's actor."""
