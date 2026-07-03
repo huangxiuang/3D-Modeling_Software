@@ -1545,8 +1545,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         dlg = WaypointPreciseDialog(self)
         if dlg.exec_() == QtWidgets.QDialog.Accepted:
-            xyz = dlg.get_coords()
-            self._add_waypoint(np.array(xyz))
+            coords_list = dlg.get_coords()
+            for xyz in coords_list:
+                self._add_waypoint(np.array(xyz))
             self._show_path()
 
     def _clear_waypoints(self):
@@ -2233,6 +2234,10 @@ class WaypointPreciseDialog(QtWidgets.QDialog):
         self.setWindowTitle("精准添加路径点")
         self.setMinimumSize(640, 520)
 
+        self._points = []
+        self._z_values = []
+        self._selected_z_idx = 0
+
         self._stack = QtWidgets.QStackedWidget()
         self._stack.addWidget(self._create_step1())
         self._stack.addWidget(self._create_step2())
@@ -2241,11 +2246,14 @@ class WaypointPreciseDialog(QtWidgets.QDialog):
         layout.addWidget(self._stack)
         self._stack.setCurrentIndex(0)
 
+    def _label_for(self, idx):
+        return chr(65 + idx) if idx < 26 else f"?{idx}"
+
     def _create_step1(self):
         widget = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(widget)
 
-        title = QtWidgets.QLabel("精准添加路径点 — 选择 XY 坐标")
+        title = QtWidgets.QLabel("精准添加路径点 — 选择 XY 坐标（点击添加多点）")
         title.setStyleSheet("font-weight: bold; font-size: 14px;")
         layout.addWidget(title)
 
@@ -2281,13 +2289,18 @@ class WaypointPreciseDialog(QtWidgets.QDialog):
         layout.addLayout(spin_layout)
 
         btn_layout = QtWidgets.QHBoxLayout()
+        self._btn_undo = QtWidgets.QPushButton("撤销上一点")
+        self._btn_undo.clicked.connect(self._undo_last_point)
+        self._btn_undo.setEnabled(False)
         btn_cancel = QtWidgets.QPushButton("取消")
         btn_cancel.clicked.connect(self.reject)
-        btn_next = QtWidgets.QPushButton("下一步")
-        btn_next.clicked.connect(self._go_step2)
+        self._btn_next = QtWidgets.QPushButton("下一步")
+        self._btn_next.clicked.connect(self._go_step2)
+        self._btn_next.setEnabled(False)
+        btn_layout.addWidget(self._btn_undo)
         btn_layout.addStretch()
         btn_layout.addWidget(btn_cancel)
-        btn_layout.addWidget(btn_next)
+        btn_layout.addWidget(self._btn_next)
         layout.addLayout(btn_layout)
 
         return widget
@@ -2300,18 +2313,22 @@ class WaypointPreciseDialog(QtWidgets.QDialog):
         title.setStyleSheet("font-weight: bold; font-size: 14px;")
         layout.addWidget(title)
 
-        self._fig_z = Figure(figsize=(5, 1.5))
+        self._fig_z = Figure(figsize=(5, 3))
         self._ax_z = self._fig_z.add_subplot(111)
-        self._ax_z.set_xlim(-10, 10)
-        self._ax_z.set_ylim(-0.5, 0.5)
-        self._ax_z.set_yticks([])
-        self._ax_z.set_xlabel("Z")
-        self._ax_z.grid(True, linestyle="--", alpha=0.7, axis="x")
-        self._ax_z.axvline(0, color="gray", linewidth=0.5)
+        self._ax_z.set_ylim(-20, 20)
+        self._ax_z.set_xlabel("路径距离")
+        self._ax_z.set_ylabel("高度 Z")
+        self._ax_z.grid(True, linestyle="--", alpha=0.7)
 
         self._canvas_z = FigureCanvasQTAgg(self._fig_z)
         self._canvas_z.mpl_connect("button_press_event", self._on_z_click)
         layout.addWidget(self._canvas_z)
+
+        info_layout = QtWidgets.QHBoxLayout()
+        self._lbl_point_info = QtWidgets.QLabel("当前点: -, 距离: -")
+        info_layout.addWidget(self._lbl_point_info)
+        info_layout.addStretch()
+        layout.addLayout(info_layout)
 
         self._spin_z = QtWidgets.QDoubleSpinBox()
         self._spin_z.setRange(-20, 20)
@@ -2332,15 +2349,7 @@ class WaypointPreciseDialog(QtWidgets.QDialog):
 
         return widget
 
-    def _on_xy_click(self, event):
-        if event.inaxes != self._ax_xy:
-            return
-        self._spin_x.setValue(event.xdata)
-        self._spin_y.setValue(event.ydata)
-
-    def _on_xy_spin_changed(self):
-        x = self._spin_x.value()
-        y = self._spin_y.value()
+    def _redraw_xy(self):
         self._ax_xy.clear()
         self._ax_xy.set_xlim(-10, 10)
         self._ax_xy.set_ylim(-10, 10)
@@ -2350,30 +2359,132 @@ class WaypointPreciseDialog(QtWidgets.QDialog):
         self._ax_xy.set_ylabel("Y")
         self._ax_xy.axhline(0, color="gray", linewidth=0.5)
         self._ax_xy.axvline(0, color="gray", linewidth=0.5)
-        self._ax_xy.plot(x, y, "r+", markersize=12, markeredgewidth=2)
+
+        if self._points:
+            pts = np.array(self._points)
+            self._ax_xy.plot(pts[:, 0], pts[:, 1], "-o", color="steelblue",
+                             markersize=6, linewidth=1.5)
+            for i, (x, y) in enumerate(self._points):
+                lbl = self._label_for(i)
+                self._ax_xy.annotate(lbl, (x, y), xytext=(5, 5),
+                                     textcoords="offset points",
+                                     fontweight="bold", color="red", fontsize=10)
+
         self._canvas_xy.draw_idle()
 
-    def _on_z_click(self, event):
-        if event.inaxes != self._ax_z:
+    def _on_xy_click(self, event):
+        if event.inaxes != self._ax_xy:
             return
-        self._spin_z.setValue(event.xdata)
+        self._points.append([round(event.xdata, 2), round(event.ydata, 2)])
+        block_x = self._spin_x.blockSignals(True)
+        block_y = self._spin_y.blockSignals(True)
+        self._spin_x.setValue(self._points[-1][0])
+        self._spin_y.setValue(self._points[-1][1])
+        self._spin_x.blockSignals(block_x)
+        self._spin_y.blockSignals(block_y)
+        self._redraw_xy()
+        self._btn_undo.setEnabled(True)
+        self._btn_next.setEnabled(len(self._points) >= 2)
 
-    def _on_z_spin_changed(self):
-        z = self._spin_z.value()
-        self._ax_z.clear()
-        self._ax_z.set_xlim(-10, 10)
-        self._ax_z.set_ylim(-0.5, 0.5)
-        self._ax_z.set_yticks([])
-        self._ax_z.set_xlabel("Z")
-        self._ax_z.grid(True, linestyle="--", alpha=0.7, axis="x")
-        self._ax_z.axvline(0, color="gray", linewidth=0.5)
-        self._ax_z.barh(0, z, height=0.3, color="steelblue", alpha=0.7)
-        self._ax_z.axvline(z, color="red", linewidth=2)
-        self._canvas_z.draw_idle()
+    def _on_xy_spin_changed(self):
+        if not self._points:
+            return
+        idx = len(self._points) - 1
+        self._points[idx] = [round(self._spin_x.value(), 2),
+                             round(self._spin_y.value(), 2)]
+        self._redraw_xy()
+
+    def _undo_last_point(self):
+        if not self._points:
+            return
+        self._points.pop()
+        self._redraw_xy()
+        self._btn_undo.setEnabled(bool(self._points))
+        self._btn_next.setEnabled(len(self._points) >= 2)
+        if self._points:
+            block_x = self._spin_x.blockSignals(True)
+            block_y = self._spin_y.blockSignals(True)
+            self._spin_x.setValue(self._points[-1][0])
+            self._spin_y.setValue(self._points[-1][1])
+            self._spin_x.blockSignals(block_x)
+            self._spin_y.blockSignals(block_y)
+    
+    def _compute_cumulative_distances(self):
+        if len(self._points) < 2:
+            return [0.0]
+        dists = [0.0]
+        total = 0.0
+        for i in range(len(self._points) - 1):
+            total += math.dist(self._points[i], self._points[i + 1])
+            dists.append(total)
+        return dists
 
     def _go_step2(self):
+        if len(self._points) < 2:
+            return
+        self._z_values = [0.0] * len(self._points)
+        self._selected_z_idx = 0
         self._stack.setCurrentIndex(1)
-        self._on_z_spin_changed()
+        self._redraw_z()
+
+    def _redraw_z(self):
+        self._ax_z.clear()
+        if len(self._points) < 2:
+            self._canvas_z.draw_idle()
+            return
+
+        cum_dists = self._compute_cumulative_distances()
+        labels = [self._label_for(i) for i in range(len(self._points))]
+
+        self._ax_z.plot(cum_dists, self._z_values, "-o", color="steelblue",
+                        markersize=8, linewidth=2, zorder=3)
+
+        sel_x = cum_dists[self._selected_z_idx]
+        sel_y = self._z_values[self._selected_z_idx]
+        self._ax_z.axvline(sel_x, color="red", linestyle="--", linewidth=1, zorder=1)
+
+        for i, (cx, cy) in enumerate(zip(cum_dists, self._z_values)):
+            self._ax_z.annotate(labels[i], (cx, cy), xytext=(5, 5),
+                                textcoords="offset points",
+                                fontweight="bold",
+                                color="red" if i == self._selected_z_idx else "gray",
+                                fontsize=10)
+
+        self._ax_z.axhline(0, color="gray", linewidth=0.5)
+        self._ax_z.set_xlabel("路径距离")
+        self._ax_z.set_ylabel("高度 Z")
+        self._ax_z.set_ylim(-20, 20)
+        self._ax_z.grid(True, linestyle="--", alpha=0.7)
+        self._ax_z.set_xticks(cum_dists)
+        self._ax_z.set_xticklabels([f"{d:.2f}" for d in cum_dists], rotation=45)
+
+        sel_label = self._label_for(self._selected_z_idx)
+        self._lbl_point_info.setText(f"当前点: {sel_label}, 距离: {sel_x:.2f}")
+        block = self._spin_z.blockSignals(True)
+        self._spin_z.setValue(self._z_values[self._selected_z_idx])
+        self._spin_z.blockSignals(block)
+
+        self._canvas_z.draw_idle()
+
+    def _on_z_click(self, event):
+        if event.inaxes != self._ax_z or len(self._points) < 2:
+            return
+        cum_dists = self._compute_cumulative_distances()
+        idx = min(range(len(cum_dists)), key=lambda i: abs(cum_dists[i] - event.xdata))
+        self._selected_z_idx = idx
+        self._z_values[idx] = round(event.ydata, 2)
+        self._redraw_z()
+
+    def _on_z_spin_changed(self):
+        if not self._z_values or self._selected_z_idx >= len(self._z_values):
+            return
+        self._z_values[self._selected_z_idx] = round(self._spin_z.value(), 2)
+        self._redraw_z()
 
     def get_coords(self):
-        return [self._spin_x.value(), self._spin_y.value(), self._spin_z.value()]
+        result = []
+        for i in range(len(self._points)):
+            x, y = self._points[i]
+            z = self._z_values[i] if i < len(self._z_values) else 0.0
+            result.append([x, y, z])
+        return result
