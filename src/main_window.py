@@ -231,7 +231,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Per-aircraft waypoints (ID-20)
         self._aircraft_waypoints = {}   # name → list of waypoints (shared path attribute)
         # Saved flight states (ID-20)
-        self._saved_flight_states = []  # list of {offset, yaw, pitch, roll, time}
+        
         # Independent flight window (ID-20)
         self._flight_window = None
         # Timeline (ID-20)
@@ -253,7 +253,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._setup_toolbar()
         self._setup_docks()
         self._set_coord_system(self.coord_system)  # sync spinbox prefixes at startup
-        self._refresh_layers()
+        self._refresh_ui()
 
         # ── Wire interaction callbacks on the plotter ──
         self.plotter.click_callback = self._on_3d_click
@@ -549,18 +549,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
             lm_layout.addLayout(row)
 
-        line = QtWidgets.QFrame()
-        line.setFrameShape(QtWidgets.QFrame.HLine)
-        line.setFrameShadow(QtWidgets.QFrame.Sunken)
-        lm_layout.addWidget(line)
-
-        lm_layout.addWidget(QtWidgets.QLabel("场景对象"))
-        self.scene_tree = QtWidgets.QTreeWidget()
-        self.scene_tree.setHeaderLabels(["名称", "类型"])
-        self.scene_tree.setAlternatingRowColors(True)
-        self.scene_tree.itemClicked.connect(self._on_tree_select)
-        lm_layout.addWidget(self.scene_tree, 1)
-
         dock_layers.setWidget(lm_widget)
         self.addDockWidget(Qt.LeftDockWidgetArea, dock_layers)
 
@@ -607,9 +595,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_clear_wp = QtWidgets.QPushButton("清除路径")
         self._btn_clear_wp.clicked.connect(self._clear_waypoints)
         pl.addWidget(self._btn_clear_wp)
-        self._btn_show_path = QtWidgets.QPushButton("显示路径")
-        self._btn_show_path.clicked.connect(self._show_path)
-        pl.addWidget(self._btn_show_path)
 
         # Waypoint counter
         self._wp_count_label = QtWidgets.QLabel("当前路径点: 0")
@@ -664,29 +649,14 @@ class MainWindow(QtWidgets.QMainWindow):
         pl.addWidget(self._timeline_container)
         self._timeline_container.hide()
 
-        # ── Save state + Copy path buttons (ID-20) ──
-        action_row = QtWidgets.QHBoxLayout()
-        self._btn_save_state = QtWidgets.QPushButton("保存当前姿态")
-        self._btn_save_state.clicked.connect(self._save_current_state)
-        self._btn_save_state.setEnabled(False)
-        action_row.addWidget(self._btn_save_state)
+        # ── Copy path button (ID-20) ──
         self._btn_copy_path = QtWidgets.QPushButton("复制路径到...")
         self._btn_copy_path.clicked.connect(self._copy_path_to_aircraft)
-        action_row.addWidget(self._btn_copy_path)
-        pl.addLayout(action_row)
+        pl.addWidget(self._btn_copy_path)
 
         pl.addStretch()
         dock_path.setWidget(pw)
         self.addDockWidget(Qt.LeftDockWidgetArea, dock_path)
-
-        # ── Right: 图层控制 ──
-        dock_layer = QtWidgets.QDockWidget("图层控制", self)
-        self._layer_widget = QtWidgets.QWidget()
-        self._layer_layout = QtWidgets.QVBoxLayout(self._layer_widget)
-        self._layer_chk = {}
-        self._custom_chk = {}
-        dock_layer.setWidget(self._layer_widget)
-        self.addDockWidget(Qt.RightDockWidgetArea, dock_layer)
 
         # ── Right: 对象控制 ──
         dock_ctrl = QtWidgets.QDockWidget("对象控制", self)
@@ -905,98 +875,11 @@ class MainWindow(QtWidgets.QMainWindow):
     #  Layer / tree panels
     # ═══════════════════════════════════════════════════════════════
 
-    def _refresh_layers(self):
-        """Rebuild the layer-control checkboxes and scene tree,
-        then refresh the object-control combo box."""
-        # ── Remove old checkboxes ──
-        for cb in self._layer_chk.values():
-            self._layer_layout.removeWidget(cb)
-            cb.deleteLater()
-        self._layer_chk.clear()
-        for cb in self._custom_chk.values():
-            self._layer_layout.removeWidget(cb)
-            cb.deleteLater()
-        self._custom_chk.clear()
-
-        # ── Built-in scene objects (excl. terrain layers managed in 图层管理) ──
-        skip = {"terrain", "layer_sand", "layer_grass", "layer_earth", "vegetation"}
-        for name in self.scene_objects:
-            if name in skip:
-                continue
-            info = self.scene_objects[name]
-            cb = QtWidgets.QCheckBox(name)
-            cb.setChecked(info["visible"])
-            cb.toggled.connect(lambda checked, n=name: self._toggle_layer(n, checked))
-            self._layer_layout.addWidget(cb)
-            self._layer_chk[name] = cb
-
-        # ── Custom / imported objects ──
-        for name in self.custom_objects:
-            cb = QtWidgets.QCheckBox(f"[自定义] {name}")
-            cb.setChecked(True)
-            cb.toggled.connect(lambda checked, n=name: self._toggle_custom(n, checked))
-            self._layer_layout.addWidget(cb)
-            self._custom_chk[name] = cb
-
-        self._layer_layout.addStretch()
-        self._populate_tree()
+    def _refresh_ui(self):
+        """Refresh flight combo and terrain UI."""
         self._refresh_obj_combo()
         self._refresh_flight_combo()
         self._refresh_terrain_ui()
-
-    def _toggle_layer(self, name, visible):
-        """Show / hide a built-in scene object."""
-        info = self.scene_objects.get(name)
-        if info is None:
-            return
-        info["visible"] = visible
-        if visible:
-            self._rebuild_actor(name)
-            self._apply_obj_transform_to_actor(name)
-        else:
-            self._remove_actor(name)
-        self.plotter.render()
-
-    def _toggle_custom(self, name, visible):
-        """Show / hide a custom or imported object."""
-        mesh = self.custom_objects.get(name)
-        if mesh is None:
-            return
-        actor_name = f"_custom_{name}"
-        if visible:
-            actor = self.plotter.add_mesh(
-                mesh, color="gold", style="wireframe", line_width=2, opacity=0.8
-            )
-            self.plotter_actors[actor_name] = actor
-            self._register_actor_reverse_lookup(actor, actor_name)
-            self._tag_mesh(mesh, actor_name)
-        else:
-            self._remove_actor(actor_name)
-        self.plotter.render()
-
-    def _populate_tree(self):
-        """Populate the 3D scene tree widget."""
-        self.scene_tree.clear()
-        for name in self.scene_objects:
-            item = QtWidgets.QTreeWidgetItem([name, "场景"])
-            self.scene_tree.addTopLevelItem(item)
-        for name in self.custom_objects:
-            item = QtWidgets.QTreeWidgetItem([f"[模型] {name}", "用户"])
-            self.scene_tree.addTopLevelItem(item)
-        if self.waypoints:
-            item = QtWidgets.QTreeWidgetItem(
-                ["路径点", f"{len(self.waypoints)} 个点"]
-            )
-            self.scene_tree.addTopLevelItem(item)
-        if self._path_actor is not None:
-            item = QtWidgets.QTreeWidgetItem(["路径曲线", "已生成"])
-            self.scene_tree.addTopLevelItem(item)
-
-    def _on_tree_select(self, item, col):
-        """Handle tree-item selection → highlight in 3D view."""
-        name = item.text(0)
-        clean = name.replace("[模型] ", "").replace("[自定义] ", "")
-        self._select_object(clean)
 
     def _refresh_obj_combo(self):
         """Rebuild the object-control combo box."""
@@ -1421,7 +1304,6 @@ class MainWindow(QtWidgets.QMainWindow):
             if name in self.scene_objects or name in self.custom_objects:
                 self._obj_transforms[name] = t
                 self._apply_obj_transform_to_actor(name)
-        self._populate_tree()
         self._refresh_obj_combo()
         self.plotter.render()
         self.statusBar().showMessage(f"场景已加载: {path}", 3000)
@@ -1559,7 +1441,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._obj_transforms[obj_name] = t
                 self._apply_obj_transform_to_actor(obj_name)
 
-        self._populate_tree()
         self._refresh_obj_combo()
         self._refresh_flight_combo()
         self._on_obj_select_changed(self._obj_combo.currentIndex())
@@ -1607,7 +1488,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if "camera" in terrain_data:
             self.plotter.camera_position = tuple(terrain_data["camera"])
 
-        self._populate_tree()
         self._refresh_obj_combo()
         self.plotter.render()
         self.statusBar().showMessage(f"场景数据已载入 (excl. aircraft): {base_name}", 5000)
@@ -1687,7 +1567,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plotter_actors[actor_name] = actor
         self._register_actor_reverse_lookup(actor, actor_name)
         self._tag_mesh(mesh, actor_name)
-        self._refresh_layers()
         self.plotter.render()
         self.statusBar().showMessage(f"已导入: {name}", 3000)
 
@@ -1752,7 +1631,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._wp_actors.append(label_actor)
 
         self.plotter.render()
-        self._populate_tree()
         self._wp_count_label.setText(f"当前路径点: {idx}")
         self.statusBar().showMessage(
             f"路径点 #{idx}:  {world_pos[0]:.2f}, {world_pos[1]:.2f}, {world_pos[2]:.2f}",
@@ -1778,7 +1656,6 @@ class MainWindow(QtWidgets.QMainWindow):
             coords_list = dlg.get_coords()
             for xyz in coords_list:
                 self._add_waypoint(np.array(xyz))
-            self._show_path()
 
     def _clear_waypoints(self):
         self.waypoints.clear()
@@ -1788,40 +1665,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._path_actor is not None:
             self.plotter.remove_actor(self._path_actor)
             self._path_actor = None
-        self._populate_tree()
         self._wp_count_label.setText("当前路径点: 0")
         self.plotter.render()
-
-    def _show_path(self):
-        """Generate a smooth spline through all waypoints and display it."""
-        if self._path_actor is not None:
-            self.plotter.remove_actor(self._path_actor)
-            self._path_actor = None
-
-        if len(self.waypoints) < 2:
-            self.statusBar().showMessage("路径点不足（至少需要 2 个点）", 3000)
-            return
-
-        pts = np.array(self.waypoints)
-        try:
-            spline = pv.Spline(pts, n_points=len(pts) * 20)
-            self._path_actor = self.plotter.add_mesh(
-                spline, color="cyan", line_width=4, opacity=0.9
-            )
-        except Exception:
-            poly = pv.PolyData(pts)
-            poly.lines = np.array([[len(pts)] + list(range(len(pts)))],
-                                  dtype=np.int64)
-            self._path_actor = self.plotter.add_mesh(
-                poly, color="cyan", line_width=4, opacity=0.9
-            )
-
-        self._populate_tree()
-        self.plotter.render()
-        self.statusBar().showMessage(
-            f"路径已生成 ({len(self.waypoints)} 个控制点)", 3000
-        )
-
 
     # ═══════════════════════════════════════════════════════════════
     #  Flight animation (ID-11)
@@ -1991,8 +1836,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_timeline_label(0)
         self._setup_keyframe_labels(len(aircraft_wps))
         self._timeline_container.show()
-        self._btn_save_state.setEnabled(True)
-
         self._btn_start_flight.setText("停止飞行")
         self._flight_aircraft_combo.setEnabled(False)
         self._btn_save_flight.setEnabled(False)
@@ -2019,7 +1862,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Hide timeline (ID-20)
         self._timeline_container.hide()
-        self._btn_save_state.setEnabled(False)
 
         # Close independent flight window (ID-20)
         if self._flight_window is not None:
@@ -2343,8 +2185,6 @@ class MainWindow(QtWidgets.QMainWindow):
         num_wp = len(saved_wps) + 1  # +1 for start position
         self._setup_keyframe_labels(num_wp)
         self._timeline_container.show()
-        self._btn_save_state.setEnabled(True)
-
         self._btn_start_flight.setText("停止飞行")
         self._flight_aircraft_combo.setEnabled(False)
         self._btn_save_flight.setEnabled(False)
@@ -2450,29 +2290,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._flight_active:
             self._flight_timer.start(self.FLIGHT_INTERVAL_MS)
 
-    # ── Save current state (ID-20) ─────────────────────────
-
-    def _save_current_state(self):
-        """Save current aircraft position + attitude + timestamp."""
-        if not self._flight_active:
-            return
-        name = self._flight_aircraft
-        if name not in self._obj_transforms:
-            return
-        t = self._obj_transforms[name]
-        current_ms = self._tl_slider.value()
-        state = {
-            "offset": list(t["offset"]),
-            "yaw": float(t.get("yaw", 0.0)),
-            "pitch": float(t.get("pitch", 0.0)),
-            "roll": float(t.get("roll", 0.0)),
-            "time_ms": current_ms,
-        }
-        self._saved_flight_states.append(state)
-        self.statusBar().showMessage(
-            f"已保存姿态 #{len(self._saved_flight_states)}  (t={current_ms/1000:.1f}s)", 3000
-        )
-
     # ── Copy path to another aircraft (ID-20) ──────────────
 
     def _copy_path_to_aircraft(self):
@@ -2502,7 +2319,11 @@ class MainWindow(QtWidgets.QMainWindow):
         mesh_data = self.scene_objects.get(name)
         if mesh_data is None:
             return
-        self._flight_window = FlightWindow(self, name, mesh_data["mesh"], mesh_data["params"])
+        # Copy the mesh so VTK objects are NOT shared between two render
+        # windows — sharing causes segfaults on macOS (OpenGL context
+        # conflicts) and is fragile across platforms.
+        mesh_copy = mesh_data["mesh"].copy()
+        self._flight_window = FlightWindow(self, name, mesh_copy, mesh_data["params"])
         self._flight_window.finished.connect(self._on_flight_window_closed)
         self._flight_window.show()
 
@@ -2727,17 +2548,17 @@ class FlightWindow(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        # Renderer — create, defer actual render to _init_view()
+        # Renderer — create (first render deferred to showEvent)
         self.plotter = ClickablePlotter(self)
         self.plotter.background_color = "#1a1a2e"
         layout.addWidget(self.plotter)
 
-        # Add terrain for spatial context (extract surface to avoid
-        # StructuredGrid issues in secondary renderers)
+        # Add terrain for spatial context — copy mesh so VTK objects are
+        # NOT shared across render windows (avoids segfaults on macOS).
         terrain_info = parent.scene_objects.get("terrain")
         if terrain_info:
             try:
-                t_mesh = terrain_info["mesh"]
+                t_mesh = terrain_info["mesh"].copy()
                 if hasattr(t_mesh, "extract_surface"):
                     t_mesh = t_mesh.extract_surface()
                 tp = dict(terrain_info["params"])
@@ -2748,7 +2569,7 @@ class FlightWindow(QtWidgets.QDialog):
             except Exception:
                 pass
 
-        # Add aircraft (fresh actor for this renderer)
+        # Add aircraft
         self.fw_actor = None
         try:
             self.fw_actor = self.plotter.add_mesh(mesh, **params)
@@ -2765,13 +2586,18 @@ class FlightWindow(QtWidgets.QDialog):
             pass
 
         self.plotter.camera_position = [(18, -16, 8), (0, 0, 2), (0, 0, 1)]
+        self._rendered_once = False
 
-        # Defer the first render to after the widget is mapped (avoids
-        # OpenGL context crash with secondary QVTK windows).
-        QtCore.QTimer.singleShot(50, self._init_view)
+    def showEvent(self, event):
+        """Defer first render until the widget has a valid OpenGL context."""
+        super().showEvent(event)
+        if not self._rendered_once:
+            self._rendered_once = True
+            # Must schedule after showEvent returns so the window is mapped.
+            QtCore.QTimer.singleShot(0, self._flush_init)
 
-    def _init_view(self):
-        """Deferred initial render — called once after the window is mapped."""
+    def _flush_init(self):
+        """First render — runs once after the window is mapped."""
         try:
             self.plotter.render()
         except Exception as e:
