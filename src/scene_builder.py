@@ -334,13 +334,13 @@ def build_terrain_layer_meshes(grid, Z):
         "layer_sand": {
             "mesh": sand_mesh,
             "type": "mesh",
-            "visible": True,
+            "visible": False,
             "params": {
                 "scalars": "elevation",
                 "cmap": ["#f5e6b8", "#e8c76a", "#d4a843"],
                 "clim": [z_min, sand_max],
                 "smooth_shading": True,
-                "opacity": 0.0,
+                "opacity": 1.0,
                 "show_scalar_bar": False,
             },
             "extra": None,
@@ -349,13 +349,13 @@ def build_terrain_layer_meshes(grid, Z):
         "layer_grass": {
             "mesh": grass_mesh,
             "type": "mesh",
-            "visible": True,
+            "visible": False,
             "params": {
                 "scalars": "elevation",
                 "cmap": ["#a8d5a2", "#5a9e4c", "#2d6b28"],
                 "clim": [sand_max, grass_max],
                 "smooth_shading": True,
-                "opacity": 0.0,
+                "opacity": 1.0,
                 "show_scalar_bar": False,
             },
             "extra": None,
@@ -364,13 +364,13 @@ def build_terrain_layer_meshes(grid, Z):
         "layer_earth": {
             "mesh": earth_mesh,
             "type": "mesh",
-            "visible": True,
+            "visible": False,
             "params": {
                 "scalars": "elevation",
                 "cmap": ["#d4b896", "#8b6f47", "#5c4033"],
                 "clim": [grass_max, earth_max],
                 "smooth_shading": True,
-                "opacity": 0.0,
+                "opacity": 1.0,
                 "show_scalar_bar": False,
             },
             "extra": None,

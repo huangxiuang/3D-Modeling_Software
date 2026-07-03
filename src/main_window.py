@@ -152,20 +152,35 @@ class FlightPlotter(ClickablePlotter):
 
     macOS VTK crashes when a second ``QVTKRenderWindowInteractor`` is
     created in the same process — the secondary OpenGL context conflicts
-    with the first.  This subclass suppresses the implicit ``render()``
-    calls that ``QtInteractor.__init__`` and every ``add_mesh`` perform,
-    then triggers the first real render from ``showEvent``.
+    with the first.  This subclass:
+      1. Shares the parent window's render context via
+         ``SetSharedRenderWindow`` so macOS sees a single OpenGL context.
+      2. Suppresses all implicit ``render()`` calls until ``showEvent``
+         to avoid touching the context before it is fully set up.
+      3. Sets ``OffScreenRendering`` to prevent the secondary
+         ``QVTKRenderWindowInteractor`` from creating a native NSWindow
+         that would collide with the primary window.
     """
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, shared_render_window=None):
         self._flight_ready = False
         super().__init__(parent)
+        # Share the primary window's render context so macOS does NOT
+        # create a second, conflicting OpenGL context.
+        if shared_render_window is not None:
+            self.render_window.SetSharedRenderWindow(shared_render_window)
+        # Off-screen mode prevents the secondary QVTK widget from
+        # creating a native NSWindow/NSOpenGLContext that would conflict
+        # with the primary window's context on macOS.
         self.render_window.SetOffScreenRendering(1)
 
     def render(self, *args, **kwargs):
         if not self._flight_ready:
             return
-        super().render(*args, **kwargs)
+        try:
+            super().render(*args, **kwargs)
+        except Exception as e:
+            print(f"[FlightPlotter] render suppressed: {e}")
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -177,7 +192,15 @@ class FlightPlotter(ClickablePlotter):
         try:
             super().render()
         except Exception as e:
-            print(f"[FlightPlotter] first render: {e}")
+            print(f"[FlightPlotter] first render deferred: {e}")
+            # Retry once after a longer delay (macOS context negotiation)
+            QtCore.QTimer.singleShot(100, lambda: self._retry_render())
+
+    def _retry_render(self):
+        try:
+            super().render()
+        except Exception as e:
+            print(f"[FlightPlotter] retry render failed: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -264,8 +287,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Per-aircraft waypoints (ID-20)
         self._aircraft_waypoints = {}   # name → list of waypoints (shared path attribute)
         # Saved flight states (ID-20)
-        
-        # Independent flight window (ID-20)
+
         self._flight_window = None
         # Timeline (ID-20)
         self._total_flight_steps = 0
@@ -328,7 +350,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.scene_objects = build_default_scene()
         for name, obj in self.scene_objects.items():
-            self._add_actor(name, obj)
+            if obj.get("visible", True):
+                self._add_actor(name, obj)
 
         p.camera_position = [(18, -16, 8), (0, 0, 2), (0, 0, 1)]
         p.camera.focal_point = (0, 0, 1.5)
@@ -583,7 +606,24 @@ class MainWindow(QtWidgets.QMainWindow):
             lm_layout.addLayout(row)
 
         dock_layers.setWidget(lm_widget)
-        self.addDockWidget(Qt.LeftDockWidgetArea, dock_layers)
+
+        # ── Left: 场景对象显隐 ──
+        dock_so = QtWidgets.QDockWidget("场景对象", self)
+        so_widget = QtWidgets.QWidget()
+        so_layout = QtWidgets.QVBoxLayout(so_widget)
+        so_layout.setContentsMargins(4, 4, 4, 4)
+        so_layout.setSpacing(3)
+
+        self._scene_obj_chks = {}       # name → QCheckBox
+        self._custom_obj_chks = {}      # name → QCheckBox
+        self._so_layout = so_layout     # for _refresh_scene_objects_ui
+
+        so_layout.addStretch()
+        dock_so.setWidget(so_widget)
+
+        # Register right-side docks (图层管理 above 场景对象 above 对象控制)
+        self.addDockWidget(Qt.RightDockWidgetArea, dock_layers)
+        self.addDockWidget(Qt.RightDockWidgetArea, dock_so)
 
         # ── Left: 路径规划 ──
         dock_path = QtWidgets.QDockWidget("路径规划", self)
@@ -657,11 +697,6 @@ class MainWindow(QtWidgets.QMainWindow):
         tl.addWidget(self._tl_slider)
 
         pl.addWidget(self._timeline_container)
-
-        # ── Copy path button (ID-20) ──
-        self._btn_copy_path = QtWidgets.QPushButton("复制路径到...")
-        self._btn_copy_path.clicked.connect(self._copy_path_to_aircraft)
-        pl.addWidget(self._btn_copy_path)
 
         pl.addStretch()
         dock_path.setWidget(pw)
@@ -820,6 +855,34 @@ class MainWindow(QtWidgets.QMainWindow):
             self._remove_actor(name)
         self.plotter.render()
 
+    def _toggle_layer(self, name, visible):
+        """Show / hide a built-in scene object (tree, bird, …)."""
+        info = self.scene_objects.get(name)
+        if info is None:
+            return
+        info["visible"] = visible
+        if visible:
+            self._rebuild_actor(name)
+            self._apply_obj_transform_to_actor(name)
+        else:
+            self._remove_actor(name)
+        self.plotter.render()
+
+    def _toggle_custom(self, name, visible):
+        """Show / hide an imported custom object."""
+        mesh = self.custom_objects.get(name)
+        if mesh is None:
+            return
+        actor_name = f"_custom_{name}"
+        if visible:
+            actor = self.plotter.add_mesh(mesh, color="gold", style="wireframe", line_width=2, opacity=0.8)
+            self.plotter_actors[actor_name] = actor
+            self._register_actor_reverse_lookup(actor, actor_name)
+            self._tag_mesh(mesh, actor_name)
+        else:
+            self._remove_actor(actor_name)
+        self.plotter.render()
+
     def _on_terrain_opacity(self, name, value):
         """Update a terrain layer's opacity and persist to scene_objects params."""
         if name not in self.plotter_actors:
@@ -847,6 +910,57 @@ class MainWindow(QtWidgets.QMainWindow):
                 vtk_actor = self._resolve_vtk_actor(actor)
                 op = vtk_actor.GetProperty().GetOpacity()
                 setter(op)
+
+    def _refresh_scene_objects_ui(self):
+        """Rebuild the per-object visibility checkboxes in the 场景对象 dock."""
+        # Clear existing checkboxes (keep stretch at the end)
+        lo = self._so_layout
+        for i in range(lo.count() - 1, -1, -1):
+            item = lo.itemAt(i)
+            if item.widget() is not None:
+                w = item.widget()
+                lo.removeWidget(w)
+                w.deleteLater()
+
+        terrain_names = set(self._terrain_layer_names.keys())
+        scene_items = []
+        for name in self.scene_objects:
+            if name == "terrain" or name in terrain_names:
+                continue
+            label = name
+            if name.startswith("layer_"):
+                continue
+            scene_items.append((name, label, False))
+        for name in self.custom_objects:
+            scene_items.append((name, name, True))
+
+        if not scene_items:
+            lbl = QtWidgets.QLabel("(无场景对象)")
+            lbl.setStyleSheet("color: #888; font-size: 11px; padding: 4px;")
+            lo.insertWidget(lo.count() - 1, lbl)
+            return
+
+        new_chks = {}
+        new_custom_chks = {}
+        for name, label, is_custom in scene_items:
+            row = QtWidgets.QHBoxLayout()
+            row.setSpacing(4)
+            chk = QtWidgets.QCheckBox(label)
+            info = self.scene_objects.get(name)
+            if is_custom:
+                chk.setChecked(name in self.plotter_actors)
+                new_custom_chks[name] = chk
+                chk.toggled.connect(lambda checked, n=name: self._toggle_custom(n, checked))
+            else:
+                chk.setChecked(info.get("visible", True) if info else True)
+                new_chks[name] = chk
+                chk.toggled.connect(lambda checked, n=name: self._toggle_layer(n, checked))
+            row.addWidget(chk)
+            row.addStretch()
+            lo.insertLayout(lo.count() - 1, row)
+
+        self._scene_obj_chks = new_chks
+        self._custom_obj_chks = new_custom_chks
 
     def _rebuild_terrain_layers(self):
         """Re-create sand/grass/earth layer meshes from the terrain grid.
@@ -885,10 +999,11 @@ class MainWindow(QtWidgets.QMainWindow):
     # ═══════════════════════════════════════════════════════════════
 
     def _refresh_ui(self):
-        """Refresh flight combo and terrain UI."""
+        """Refresh flight combo, terrain UI, and scene-object checkboxes."""
         self._refresh_obj_combo()
         self._refresh_flight_combo()
         self._refresh_terrain_ui()
+        self._refresh_scene_objects_ui()
 
     def _refresh_obj_combo(self):
         """Rebuild the object-control combo box."""
@@ -1728,14 +1843,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage("路径点不足（至少需要 2 个点）", 3000)
             return
 
-        # Ask about independent flight window (ID-20)
-        reply = QtWidgets.QMessageBox.question(
-            self, "飞行窗口",
-            "独立窗口观看飞行?",
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-        )
-        open_independent = (reply == QtWidgets.QMessageBox.Yes)
-
         # Build flight path: start at waypoint[0], end at waypoint[-1] (ID-20)
         path = [np.array(wp) for wp in aircraft_wps]
 
@@ -1835,11 +1942,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_save_flight.setEnabled(False)
         self._btn_load_flight.setEnabled(False)
 
-        # Open independent window if requested (ID-20)
-        if open_independent:
-            self._open_flight_window(name)
-        else:
-            self._flight_window = None
+        self._flight_window = None
 
         self.plotter.render()
         self.statusBar().showMessage(
@@ -1853,14 +1956,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._flight_active = False
         self._flight_segment_idx = 0
         self._flight_step = 0
-
-        # Close independent flight window (ID-20)
-        if self._flight_window is not None:
-            try:
-                self._flight_window.close()
-            except Exception:
-                pass
-            self._flight_window = None
 
         self._btn_start_flight.setText("开始飞行")
         self._flight_aircraft_combo.setEnabled(True)
@@ -1974,13 +2069,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Apply to VTK actor on main window
         self._apply_obj_transform_to_actor(name)
-
-        # Update independent flight window if open (ID-20)
-        if self._flight_window is not None:
-            self._flight_window.update_position(name)
-            self._flight_window.update_timeline(
-                self._tl_slider.value(), self._total_flight_time_ms
-            )
 
     def _flight_tick(self):
         """Single animation step called by the flight timer."""
@@ -2225,9 +2313,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._tl_slider.blockSignals(False)
         self._update_timeline_label(current_ms)
 
-        if self._flight_window is not None:
-            self._flight_window.update_timeline(current_ms, self._total_flight_time_ms)
-
     def _update_timeline_label(self, current_ms=None):
         """Update the time label showing current / total seconds."""
         if current_ms is None:
@@ -2280,46 +2365,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._flight_active:
             self._flight_timer.start(self.FLIGHT_INTERVAL_MS)
 
-    # ── Copy path to another aircraft (ID-20) ──────────────
-
-    def _copy_path_to_aircraft(self):
-        """Copy current global waypoints to a selected aircraft."""
-        if not self.waypoints:
-            self.statusBar().showMessage("没有路径点可复制", 3000)
-            return
-
-        names = sorted(
-            n for n in self.scene_objects if "aircraft" in n.lower()
-        )
-        if not names:
-            self.statusBar().showMessage("场景中没有飞机", 3000)
-            return
-
-        item, ok = QtWidgets.QInputDialog.getItem(
-            self, "复制路径到", "选择要接收路径的飞机:", names, False
-        )
-        if ok and item:
-            self._aircraft_waypoints[item] = [list(wp) for wp in self.waypoints]
-            self.statusBar().showMessage(f"路径已复制到 {item}", 3000)
-
     # ── Independent flight window (ID-20) ──────────────────
-
-    def _open_flight_window(self, name):
-        """Open an independent FlightWindow for immersive viewing."""
-        mesh_data = self.scene_objects.get(name)
-        if mesh_data is None:
-            return
-        # Copy the mesh so VTK objects are NOT shared between two render
-        # windows — sharing causes segfaults on macOS (OpenGL context
-        # conflicts) and is fragile across platforms.
-        mesh_copy = mesh_data["mesh"].copy()
-        self._flight_window = FlightWindow(self, name, mesh_copy, mesh_data["params"])
-        self._flight_window.finished.connect(self._on_flight_window_closed)
-        self._flight_window.show()
-
-    def _on_flight_window_closed(self):
-        """Clean up when the independent flight window is closed."""
-        self._flight_window = None
 
     # ═══════════════════════════════════════════════════════════════
     #  Collision detection
@@ -2521,123 +2567,6 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
 
-class FlightWindow(QtWidgets.QDialog):
-    """Independent window with its own 3D viewport for immersive flight viewing.
-
-    Shows the aircraft against terrain context and follows it with the camera.
-    """
-
-    def __init__(self, parent, aircraft_name, mesh, params):
-        super().__init__(parent)
-        self.aircraft_name = aircraft_name
-        self.main_win = parent
-        self.setWindowTitle("飞行动画 - 独立窗口")
-        self.resize(1280, 800)
-        self.setAttribute(Qt.WA_DeleteOnClose)
-
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-
-        # Renderer — use FlightPlotter which defers all VTK operations
-        # until the widget is mapped, avoiding macOS OpenGL context crashes
-        # with secondary QVTK windows.
-        self.plotter = FlightPlotter(self)
-        self.plotter.background_color = "#1a1a2e"
-        layout.addWidget(self.plotter)
-
-        # Add terrain for spatial context — copy mesh so VTK objects are
-        # NOT shared across render windows (avoids segfaults on macOS).
-        terrain_info = parent.scene_objects.get("terrain")
-        if terrain_info:
-            try:
-                t_mesh = terrain_info["mesh"].copy()
-                if hasattr(t_mesh, "extract_surface"):
-                    t_mesh = t_mesh.extract_surface()
-                tp = dict(terrain_info["params"])
-                tp.pop("scalars", None)
-                tp.pop("cmap", None)
-                tp.pop("clim", None)
-                self.plotter.add_mesh(t_mesh, **tp)
-            except Exception:
-                pass
-
-        # Add aircraft
-        self.fw_actor = None
-        try:
-            self.fw_actor = self.plotter.add_mesh(mesh, **params)
-        except Exception as e:
-            print(f"[FlightWindow] add_mesh failed: {e}")
-
-        # Lighting
-        try:
-            light1 = pv.Light(position=(10, -10, 15), intensity=0.8)
-            light2 = pv.Light(position=(-5, 5, 8), intensity=0.4)
-            self.plotter.add_light(light1)
-            self.plotter.add_light(light2)
-        except Exception:
-            pass
-
-        self.plotter.camera_position = [(18, -16, 8), (0, 0, 2), (0, 0, 1)]
-
-    def update_position(self, name):
-        """Copy the main-window aircraft transform to this window's actor."""
-        if self.fw_actor is None:
-            return
-        if name not in self.main_win._obj_transforms:
-            return
-        t = self.main_win._obj_transforms[name]
-        vtk_actor = self.fw_actor.actor
-
-        offset = np.array(t["offset"], dtype=float)
-        orig_center = np.array(t.get("orig_center", offset), dtype=float)
-        s = float(t["scale"])
-        yaw = float(t.get("yaw", 0.0))
-        pitch = float(t.get("pitch", 0.0))
-        roll = float(t.get("roll", 0.0))
-
-        yaw_r = np.radians(yaw)
-        pitch_r = np.radians(pitch)
-        roll_r = np.radians(roll)
-
-        Rx = np.array([
-            [1, 0, 0],
-            [0, np.cos(roll_r), -np.sin(roll_r)],
-            [0, np.sin(roll_r), np.cos(roll_r)],
-        ])
-        Ry = np.array([
-            [np.cos(pitch_r), 0, np.sin(pitch_r)],
-            [0, 1, 0],
-            [-np.sin(pitch_r), 0, np.cos(pitch_r)],
-        ])
-        Rz = np.array([
-            [np.cos(yaw_r), -np.sin(yaw_r), 0],
-            [np.sin(yaw_r), np.cos(yaw_r), 0],
-            [0, 0, 1],
-        ])
-        R = Rz @ Ry @ Rx
-
-        H = np.eye(4)
-        H[:3, :3] = R * s
-        H[:3, 3] = offset - (R * s) @ orig_center
-
-        vtk_matrix = vtk.vtkMatrix4x4()
-        for i in range(4):
-            for j in range(4):
-                vtk_matrix.SetElement(i, j, float(H[i, j]))
-
-        transform = vtk.vtkTransform()
-        transform.SetMatrix(vtk_matrix)
-        vtk_actor.SetUserTransform(transform)
-
-        # Follow aircraft with camera
-        fp = offset.copy()
-        fp[2] = fp[2] + 2.0
-        self.plotter.camera.focal_point = fp
-        self.plotter.render()
-
-    def update_timeline(self, current_ms, total_ms):
-        """Synced timeline display (pass-through, no seek control here)."""
-        pass
 
 
 class WaypointPreciseDialog(QtWidgets.QDialog):
