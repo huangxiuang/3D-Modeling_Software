@@ -81,42 +81,6 @@ class ClickablePlotter(pvqt.QtInteractor):
         self.click_callback = None      # f(x, y, world_pos, vtkActor)
         self.move_callback = None       # f(x, y, world_pos)
 
-
-class FlightPlotter(ClickablePlotter):
-    """``ClickablePlotter`` variant that defers all VTK operations until shown.
-
-    macOS VTK crashes when a second ``QVTKRenderWindowInteractor`` is
-    created in the same process — the secondary OpenGL context conflicts
-    with the first.  This subclass suppresses the implicit ``render()``
-    calls that ``QtInteractor.__init__`` and every ``add_mesh`` perform,
-    then triggers the first real render from ``showEvent``.
-    """
-
-    def __init__(self, parent=None):
-        self._flight_ready = False
-        super().__init__(parent)
-        # Use offscreen rendering for the secondary render window to avoid
-        # OpenGL context conflicts with the main window.
-        self.render_window.SetOffScreenRendering(1)
-
-    def render(self, *args, **kwargs):
-        if not self._flight_ready:
-            return
-        super().render(*args, **kwargs)
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        if not self._flight_ready:
-            self._flight_ready = True
-            QtCore.QTimer.singleShot(0, self._first_render)
-
-    def _first_render(self):
-        """First real render — called once after the window is mapped."""
-        try:
-            super().render()
-        except Exception as e:
-            print(f"[FlightPlotter] first render: {e}")
-
     def _to_vtk_display(self, qt_x, qt_y):
         """Convert Qt widget coords → VTK display coords (pixels, bottom-left origin).
 
@@ -181,6 +145,39 @@ class FlightPlotter(ClickablePlotter):
                 world = np.array(wp.GetPickPosition())
                 actor = None
         self.click_callback(x, y, world, actor)
+
+
+class FlightPlotter(ClickablePlotter):
+    """``ClickablePlotter`` variant that defers all VTK operations until shown.
+
+    macOS VTK crashes when a second ``QVTKRenderWindowInteractor`` is
+    created in the same process — the secondary OpenGL context conflicts
+    with the first.  This subclass suppresses the implicit ``render()``
+    calls that ``QtInteractor.__init__`` and every ``add_mesh`` perform,
+    then triggers the first real render from ``showEvent``.
+    """
+
+    def __init__(self, parent=None):
+        self._flight_ready = False
+        super().__init__(parent)
+        self.render_window.SetOffScreenRendering(1)
+
+    def render(self, *args, **kwargs):
+        if not self._flight_ready:
+            return
+        super().render(*args, **kwargs)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._flight_ready:
+            self._flight_ready = True
+            QtCore.QTimer.singleShot(0, self._first_render)
+
+    def _first_render(self):
+        try:
+            super().render()
+        except Exception as e:
+            print(f"[FlightPlotter] first render: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════
