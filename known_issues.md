@@ -457,11 +457,49 @@ terrain没有回到之前的位置
 
 | ID | 标题 | 模块 | 严重程度 | 状态 |
 |----|------|------|----------|------|
-<!-- 所有已知问题已修复 -->
+| ID-26 | FlightWindow 独立窗口崩溃 (macOS双QVTK) | 飞行动画 | 🔴 严重 | 修复中 |
 
 ## 已关闭问题
 
 ### [ID-21] 地形颜色 / 植被图层 / ID-3拾取升级 / FlightWindow崩溃 ✅
+
+### [ID-22] 删除东北天坐标输入 + UI清理 + 隐藏高程标量条 + 时间轴常驻 + FlightWindow二次修复 ✅
+
+- **状态**: 已验证修复
+- **模块**: 路径规划 / 图层管理 / 飞行动画 / UI
+- **严重程度**: 🔴 严重
+- **发现日期**: 2026-07-03
+- **修复日期**: 2026-07-03
+**问题描述**:
+1. 删除"东北天"直接坐标输入spinbox和"添加坐标路径点"按钮
+2. 图层管理初始值设为100%透明(opacity=0.0)
+3. 地形图层的PyVista自动elevation标量条无法删除(内置),改用show_scalar_bar=False隐藏
+4. 时间滚动条应在主界面始终可见(不再飞行时才显示)
+5. FlightWindow独立窗口仍然崩溃(第一次修复不彻底)
+6. 删除上一轮残留的_show_path/_save_current_state代码
+
+**修复内容**:
+1. **删除坐标输入**: 移除`_wp_x/_wp_y/_wp_z`三连spinbox及`btn_add_coord`按钮，删除`_add_wp_from_coords()`方法，清理`_set_coord_system()`中的spinbox引用
+2. **图层初始透明**: 图层管理滑块初始值`1.0→0.0`，`scene_builder.py`中图层params`opacity: 1.0→0.0`
+3. **隐藏标量条**: `scene_builder.py`所有terrain layer params添加`show_scalar_bar: False`，抑制PyVista自动添加的elevation标量条(color bar随之消失)
+4. **时间轴常驻**: 移除`_timeline_container.hide()`和_start_flight/_stop_flight中的show()/hide()，时间轴始终显示在主界面
+5. **FlightWindow二次修复**: 创建`FlightPlotter(ClickablePlotter)`子类，延迟所有VTK渲染至showEvent，render在`_flight_ready`标志为True前为no-op，设置`render_window.SetOffScreenRendering(1)`避免macOS双QVTK窗口OpenGL上下文冲突
+6. **代码清理**: 移除_show_path残留stub，移除所有_populate_tree/_refresh_layers调用，移除图层控制dock
+
+### [ID-26] FlightWindow 独立窗口崩溃 (macOS双QVTK)
+
+- **状态**: 🔴 修复中
+- **模块**: 飞行动画 / FlightWindow
+- **严重程度**: 🔴 严重
+- **发现日期**: 2026-07-03
+**问题描述**:
+macOS上开启第二个QVTKRenderWindowInteractor时OpenGL上下文冲突，二级窗口闪1秒后崩溃。Root cause: VTK在macOS上不支持两个活动OpenGL上下文同时存在。
+
+**当前修复策略** (FlightPlotter):
+- FlightPlotter延迟所有render()至showEvent
+- OffScreenRendering(1)避免创建第二个OS原生窗口
+- 地形/飞机mesh使用.copy()避免跨渲染器VTK对象共享
+- 需用户实际验证是否完全解决
 
 - **状态**: 已验证修复
 - **模块**: 场景构建 / 图层管理 / 路径规划 / 飞行动画
