@@ -1921,15 +1921,25 @@ class MainWindow(QtWidgets.QMainWindow):
         t["offset"] = list(aircraft_wps[0])
         self._apply_obj_transform_to_actor(name)
 
-        # Compute formation offsets (ID-27)
+        # Compute formation body-frame offsets (ID-27)
         self._formation_offsets.clear()
         leader_start = np.array(aircraft_wps[0])
+        init_yaw_rad = math.radians(t.get("yaw", 0.0))
+        cos_y, sin_y = math.cos(init_yaw_rad), math.sin(init_yaw_rad)
         for fname in selected[1:]:
             ft = self._get_or_init_transform(fname)
             fpos = np.array(ft.get("offset", leader_start))
-            self._formation_offsets[fname] = fpos - leader_start
+            world_offs = fpos - leader_start
+            # Transform world offset → body-frame offset (rotate by -yaw)
+            body_offs = np.array([
+                cos_y * world_offs[0] + sin_y * world_offs[1],
+                -sin_y * world_offs[0] + cos_y * world_offs[1],
+                world_offs[2],
+            ])
+            self._formation_offsets[fname] = body_offs
             # Teleport follower to its formation position
-            ft["offset"] = (leader_start + self._formation_offsets[fname]).tolist()
+            ft["offset"] = (leader_start + world_offs).tolist()
+            ft["yaw"] = t.get("yaw", 0.0)
             self._apply_obj_transform_to_actor(fname)
 
         cache = {
@@ -2102,11 +2112,22 @@ class MainWindow(QtWidgets.QMainWindow):
         # Update formation followers relative to leader (ID-27)
         aircraft_list = getattr(self, '_flight_aircraft_list', [])
         if len(aircraft_list) > 1:
+            yaw_rad = math.radians(yaw)
+            cos_y, sin_y = math.cos(yaw_rad), math.sin(yaw_rad)
             for fname in aircraft_list[1:]:
-                offset = self._formation_offsets.get(fname)
-                if offset is not None and fname in self._obj_transforms:
-                    self._obj_transforms[fname]["offset"] = (pos + offset).tolist()
-                    self._apply_obj_transform_to_actor(fname)
+                body_offs = self._formation_offsets.get(fname)
+                if body_offs is None or fname not in self._obj_transforms:
+                    continue
+                # Rotate body-frame offset by leader's current yaw → world offset
+                world_offs = np.array([
+                    cos_y * body_offs[0] - sin_y * body_offs[1],
+                    sin_y * body_offs[0] + cos_y * body_offs[1],
+                    body_offs[2],
+                ])
+                self._obj_transforms[fname]["offset"] = (pos + world_offs).tolist()
+                self._obj_transforms[fname]["yaw"] = yaw
+                self._obj_transforms[fname]["pitch"] = pitch
+                self._apply_obj_transform_to_actor(fname)
 
     def _flight_tick(self):
         """Single animation step called by the flight timer."""
