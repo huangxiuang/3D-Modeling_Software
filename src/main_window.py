@@ -238,7 +238,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Formation flight (ID-27)
         self._formation_mode = False
         self._formation_aircraft = []   # [name, ...]  first = leader, rest = followers
-        self._formation_offsets = {}    # name → np.array offset from leader
+        self._formation_offsets = {}    # name → float trail distance
 
         # Timeline (ID-20)
         self._total_flight_steps = 0
@@ -1921,25 +1921,17 @@ class MainWindow(QtWidgets.QMainWindow):
         t["offset"] = list(aircraft_wps[0])
         self._apply_obj_transform_to_actor(name)
 
-        # Compute formation body-frame offsets (ID-27)
+        # Compute tail-chase trail distances (ID-27)
         self._formation_offsets.clear()
         leader_start = np.array(aircraft_wps[0])
-        init_yaw_rad = math.radians(t.get("yaw", 0.0))
-        cos_y, sin_y = math.cos(init_yaw_rad), math.sin(init_yaw_rad)
         for fname in selected[1:]:
             ft = self._get_or_init_transform(fname)
             fpos = np.array(ft.get("offset", leader_start))
-            world_offs = fpos - leader_start
-            # Transform world offset → body-frame offset (rotate by -yaw)
-            body_offs = np.array([
-                cos_y * world_offs[0] + sin_y * world_offs[1],
-                -sin_y * world_offs[0] + cos_y * world_offs[1],
-                world_offs[2],
-            ])
-            self._formation_offsets[fname] = body_offs
-            # Teleport follower to its formation position
-            ft["offset"] = (leader_start + world_offs).tolist()
-            ft["yaw"] = t.get("yaw", 0.0)
+            d = float(np.linalg.norm(fpos - leader_start)) or 8.0
+            self._formation_offsets[fname] = d
+            # Place follower directly behind leader at initial heading
+            ft["offset"] = (leader_start + np.array([-d, 0, 0])).tolist()
+            ft["yaw"] = 0.0
             self._apply_obj_transform_to_actor(fname)
 
         cache = {
@@ -2109,22 +2101,20 @@ class MainWindow(QtWidgets.QMainWindow):
         # Apply to VTK actor on main window
         self._apply_obj_transform_to_actor(name)
 
-        # Update formation followers relative to leader (ID-27)
+        # Update tail-chase followers: same altitude, fixed trail distance behind leader (ID-27)
         aircraft_list = getattr(self, '_flight_aircraft_list', [])
         if len(aircraft_list) > 1:
             yaw_rad = math.radians(yaw)
-            cos_y, sin_y = math.cos(yaw_rad), math.sin(yaw_rad)
+            hx, hy = math.cos(yaw_rad), math.sin(yaw_rad)  # leader heading
             for fname in aircraft_list[1:]:
-                body_offs = self._formation_offsets.get(fname)
-                if body_offs is None or fname not in self._obj_transforms:
+                d = self._formation_offsets.get(fname)
+                if d is None or fname not in self._obj_transforms:
                     continue
-                # Rotate body-frame offset by leader's current yaw → world offset
-                world_offs = np.array([
-                    cos_y * body_offs[0] - sin_y * body_offs[1],
-                    sin_y * body_offs[0] + cos_y * body_offs[1],
-                    body_offs[2],
-                ])
-                self._obj_transforms[fname]["offset"] = (pos + world_offs).tolist()
+                # Follower position: directly behind leader along its heading
+                fx = pos[0] - hx * d
+                fy = pos[1] - hy * d
+                fz = pos[2]  # same altitude
+                self._obj_transforms[fname]["offset"] = [fx, fy, fz]
                 self._obj_transforms[fname]["yaw"] = yaw
                 self._obj_transforms[fname]["pitch"] = pitch
                 self._apply_obj_transform_to_actor(fname)
