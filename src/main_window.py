@@ -1921,16 +1921,15 @@ class MainWindow(QtWidgets.QMainWindow):
         t["offset"] = list(aircraft_wps[0])
         self._apply_obj_transform_to_actor(name)
 
-        # Compute tail-chase trail distances (ID-27)
+        # Fixed tail-chase distance, close but not overlapping (ID-27)
+        TRAIL_DIST = 5.0
         self._formation_offsets.clear()
         leader_start = np.array(aircraft_wps[0])
         for fname in selected[1:]:
-            ft = self._get_or_init_transform(fname)
-            fpos = np.array(ft.get("offset", leader_start))
-            d = float(np.linalg.norm(fpos - leader_start)) or 8.0
-            self._formation_offsets[fname] = d
+            self._formation_offsets[fname] = TRAIL_DIST
             # Place follower directly behind leader at initial heading
-            ft["offset"] = (leader_start + np.array([-d, 0, 0])).tolist()
+            ft = self._get_or_init_transform(fname)
+            ft["offset"] = (leader_start + np.array([-TRAIL_DIST, 0, 0])).tolist()
             ft["yaw"] = 0.0
             self._apply_obj_transform_to_actor(fname)
 
