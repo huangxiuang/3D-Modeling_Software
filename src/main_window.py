@@ -1796,6 +1796,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     CRUISE_SPEED = 5.0
     FLIGHT_INTERVAL_MS = 50
+    FORMATION_TRAIL_DIST = 3.0
     _MIN_FLIGHT_STEPS = 10
     _MAX_FLIGHT_STEPS = 300
 
@@ -1922,14 +1923,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_obj_transform_to_actor(name)
 
         # Fixed tail-chase distance, close but not overlapping (ID-27)
-        TRAIL_DIST = 3.0
         self._formation_offsets.clear()
         leader_start = np.array(aircraft_wps[0])
         for fname in selected[1:]:
-            self._formation_offsets[fname] = TRAIL_DIST
+            self._formation_offsets[fname] = self.FORMATION_TRAIL_DIST
             # Place follower directly behind leader at initial heading
             ft = self._get_or_init_transform(fname)
-            ft["offset"] = (leader_start + np.array([-TRAIL_DIST, 0, 0])).tolist()
+            ft["offset"] = (leader_start + np.array([-self.FORMATION_TRAIL_DIST, 0, 0])).tolist()
             ft["yaw"] = 0.0
             self._apply_obj_transform_to_actor(fname)
 
@@ -2190,6 +2190,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         data = {
             "aircraft_name": cache["aircraft_name"],
+            "formation": cache.get("formation", [cache["aircraft_name"]]),
             "start_position": cache["start_position"],
             "waypoints": cache["waypoints"],
             "segments": segments,
@@ -2316,8 +2317,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_save_flight.setEnabled(False)
         self._btn_load_flight.setEnabled(False)
 
+        # Restore formation followers from saved data (ID-27)
+        formation = data.get("formation", [name])
+        self._flight_aircraft_list = formation
+        self._formation_offsets.clear()
+        for fname in formation[1:]:
+            self._formation_offsets[fname] = self.FORMATION_TRAIL_DIST
+            ft = self._get_or_init_transform(fname)
+            ft["offset"] = (np.array(start_pos) + np.array([-self.FORMATION_TRAIL_DIST, 0, 0])).tolist()
+            ft["yaw"] = 0.0
+            self._apply_obj_transform_to_actor(fname)
+
         self.statusBar().showMessage(
-            f"载入飞行数据: {name} ({len(segments)} 个段)", 3000
+            f"载入飞行数据: {name}" + (f" (编队 {len(formation)}机)" if len(formation) > 1 else "") + f" ({len(segments)} 个段)", 3000
         )
         self._flight_timer.start(interval_ms)
 
