@@ -1922,7 +1922,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_obj_transform_to_actor(name)
 
         # Fixed tail-chase distance, close but not overlapping (ID-27)
-        TRAIL_DIST = 5.0
+        TRAIL_DIST = 3.0
         self._formation_offsets.clear()
         leader_start = np.array(aircraft_wps[0])
         for fname in selected[1:]:
