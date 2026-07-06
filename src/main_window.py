@@ -147,62 +147,6 @@ class ClickablePlotter(pvqt.QtInteractor):
         self.click_callback(x, y, world, actor)
 
 
-class FlightPlotter(ClickablePlotter):
-    """``ClickablePlotter`` variant that defers all VTK operations until shown.
-
-    macOS VTK crashes when a second ``QVTKRenderWindowInteractor`` is
-    created in the same process — the secondary OpenGL context conflicts
-    with the first.  This subclass:
-      1. Shares the parent window's render context via
-         ``SetSharedRenderWindow`` so macOS sees a single OpenGL context.
-      2. Suppresses all implicit ``render()`` calls until ``showEvent``
-         to avoid touching the context before it is fully set up.
-      3. Sets ``OffScreenRendering`` to prevent the secondary
-         ``QVTKRenderWindowInteractor`` from creating a native NSWindow
-         that would collide with the primary window.
-    """
-
-    def __init__(self, parent=None, shared_render_window=None):
-        self._flight_ready = False
-        super().__init__(parent)
-        # Share the primary window's render context so macOS does NOT
-        # create a second, conflicting OpenGL context.
-        if shared_render_window is not None:
-            self.render_window.SetSharedRenderWindow(shared_render_window)
-        # Off-screen mode prevents the secondary QVTK widget from
-        # creating a native NSWindow/NSOpenGLContext that would conflict
-        # with the primary window's context on macOS.
-        self.render_window.SetOffScreenRendering(1)
-
-    def render(self, *args, **kwargs):
-        if not self._flight_ready:
-            return
-        try:
-            super().render(*args, **kwargs)
-        except Exception as e:
-            print(f"[FlightPlotter] render suppressed: {e}")
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        if not self._flight_ready:
-            self._flight_ready = True
-            QtCore.QTimer.singleShot(0, self._first_render)
-
-    def _first_render(self):
-        try:
-            super().render()
-        except Exception as e:
-            print(f"[FlightPlotter] first render deferred: {e}")
-            # Retry once after a longer delay (macOS context negotiation)
-            QtCore.QTimer.singleShot(100, lambda: self._retry_render())
-
-    def _retry_render(self):
-        try:
-            super().render()
-        except Exception as e:
-            print(f"[FlightPlotter] retry render failed: {e}")
-
-
 # ═══════════════════════════════════════════════════════════════
 #  MainWindow
 # ═══════════════════════════════════════════════════════════════
@@ -282,6 +226,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._flight_step = 0
         self._flight_steps_per_segment = 0
         self._flight_aircraft = ""
+        self._flight_aircraft_list = []  # all aircraft in current flight (ID-27)
         self._flight_data_cache = None  # saved for later export
 
         # Per-aircraft waypoints (ID-20)
@@ -289,6 +234,12 @@ class MainWindow(QtWidgets.QMainWindow):
         # Saved flight states (ID-20)
 
         self._flight_window = None
+
+        # Formation flight (ID-27)
+        self._formation_mode = False
+        self._formation_aircraft = []   # [name, ...]  first = leader, rest = followers
+        self._formation_offsets = {}    # name → np.array offset from leader
+
         # Timeline (ID-20)
         self._total_flight_steps = 0
         self._total_flight_time_ms = 0
@@ -669,7 +620,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_load_flight = QtWidgets.QPushButton("载入飞行数据")
         self._btn_load_flight.clicked.connect(self._load_flight_data)
         flight_save_row.addWidget(self._btn_load_flight)
+        self._btn_formation = QtWidgets.QPushButton("编队飞行")
+        self._btn_formation.setCheckable(True)
+        self._btn_formation.setStyleSheet(
+            "QPushButton:checked { background-color: #4a90d9; color: white; font-weight: bold; }"
+        )
+        self._btn_formation.toggled.connect(self._on_formation_toggled)
+        flight_save_row.addWidget(self._btn_formation)
         pl.addLayout(flight_save_row)
+
+        # Formation aircraft list (hidden by default)
+        self._formation_list = QtWidgets.QListWidget()
+        self._formation_list.setMaximumHeight(100)
+        self._formation_list.setVisible(False)
+        pl.addWidget(self._formation_list)
 
         # ── Timeline container (ID-20, hidden until flight starts) ──
         self._timeline_container = QtWidgets.QWidget()
@@ -1795,6 +1759,37 @@ class MainWindow(QtWidgets.QMainWindow):
             self._flight_aircraft_combo.setCurrentIndex(idx)
         self._flight_aircraft_combo.blockSignals(False)
 
+    # ── Formation flight (ID-27) ──────────────────────────
+
+    def _on_formation_toggled(self, checked):
+        """Show/hide the formation aircraft list when toggle button is clicked."""
+        self._formation_mode = checked
+        self._formation_list.setVisible(checked)
+        if checked:
+            self._refresh_formation_list()
+
+    def _refresh_formation_list(self):
+        """Populate the formation list with checkable aircraft items."""
+        self._formation_list.clear()
+        for name in self.scene_objects:
+            if "aircraft" in name.lower():
+                item = QtWidgets.QListWidgetItem(name)
+                item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+                item.setCheckState(QtCore.Qt.Unchecked)
+                self._formation_list.addItem(item)
+
+    def _get_formation_selection(self):
+        """Return list of checked aircraft names from the formation list.
+
+        First checked item is the leader, rest are followers.
+        """
+        selected = []
+        for i in range(self._formation_list.count()):
+            item = self._formation_list.item(i)
+            if item.checkState() == QtCore.Qt.Checked:
+                selected.append(item.text())
+        return selected
+
     # ────────────────────────────────────────────────────────────────
     #  ID-15: Flight speed model (systematic, physics-aware)
     # ────────────────────────────────────────────────────────────────
@@ -1827,17 +1822,31 @@ class MainWindow(QtWidgets.QMainWindow):
         return self.CRUISE_SPEED * k_pitch * k_turn
 
     def _start_flight(self):
-        """Animate the selected aircraft through all waypoints."""
+        """Animate the selected aircraft through all waypoints.
+
+        In formation mode, the leader (first checked aircraft) follows the path;
+        followers maintain their initial offset from the leader.
+        """
         if self._flight_active:
             self._stop_flight()
             return
 
-        name = self._flight_aircraft_combo.currentText()
+        # Determine which aircraft to fly
+        if self._formation_mode:
+            selected = self._get_formation_selection()
+            if len(selected) < 1:
+                self.statusBar().showMessage("编队模式：请至少选择一架飞机", 3000)
+                return
+            name = selected[0]  # leader
+        else:
+            name = self._flight_aircraft_combo.currentText()
+            selected = [name] if name else []
+
         if not name:
             self.statusBar().showMessage("请先选择一架飞机", 3000)
             return
 
-        # Get waypoints for this aircraft (ID-20: per-aircraft waypoints)
+        # Get waypoints for the leader (ID-20: per-aircraft waypoints)
         aircraft_wps = self._get_aircraft_waypoints(name)
         if len(aircraft_wps) < 2:
             self.statusBar().showMessage("路径点不足（至少需要 2 个点）", 3000)
@@ -1846,7 +1855,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Build flight path: start at waypoint[0], end at waypoint[-1] (ID-20)
         path = [np.array(wp) for wp in aircraft_wps]
 
-        # Ensure transform exists
+        # Ensure leader transform exists
         t = self._get_or_init_transform(name)
 
         # ── Build segments with speed-aware step count ──
@@ -1908,12 +1917,24 @@ class MainWindow(QtWidgets.QMainWindow):
         total_steps = sum(seg["steps"] for seg in segments)
         total_time_ms = total_steps * self.FLIGHT_INTERVAL_MS
 
-        # Teleport aircraft to waypoint[0] (ID-20)
+        # Teleport leader to waypoint[0]
         t["offset"] = list(aircraft_wps[0])
         self._apply_obj_transform_to_actor(name)
 
+        # Compute formation offsets (ID-27)
+        self._formation_offsets.clear()
+        leader_start = np.array(aircraft_wps[0])
+        for fname in selected[1:]:
+            ft = self._get_or_init_transform(fname)
+            fpos = np.array(ft.get("offset", leader_start))
+            self._formation_offsets[fname] = fpos - leader_start
+            # Teleport follower to its formation position
+            ft["offset"] = (leader_start + self._formation_offsets[fname]).tolist()
+            self._apply_obj_transform_to_actor(fname)
+
         cache = {
             "aircraft_name": name,
+            "formation": selected,  # all aircraft in formation (ID-27)
             "start_position": aircraft_wps[0],
             "waypoints": [wp.tolist() for wp in aircraft_wps],
             "segments": segments,
@@ -1923,6 +1944,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Start animation
         self._flight_active = True
         self._flight_aircraft = name
+        self._flight_aircraft_list = selected  # all aircraft in this flight (ID-27)
         self._flight_path = path
         self._flight_segments = segments
         self._flight_segment_idx = 0
@@ -1939,14 +1961,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._setup_keyframe_labels(len(aircraft_wps))
         self._btn_start_flight.setText("停止飞行")
         self._flight_aircraft_combo.setEnabled(False)
+        self._btn_formation.setEnabled(False)
         self._btn_save_flight.setEnabled(False)
         self._btn_load_flight.setEnabled(False)
 
         self._flight_window = None
 
         self.plotter.render()
+        count = len(selected)
+        label = f"编队 {count}机" if count > 1 else name
         self.statusBar().showMessage(
-            f"飞行开始: {name} → {len(aircraft_wps)} 个路径点 ({total_time_ms/1000:.1f}s)", 3000
+            f"飞行开始: {label} → {len(aircraft_wps)} 个路径点 ({total_time_ms/1000:.1f}s)", 3000
         )
         self._flight_timer.start(self.FLIGHT_INTERVAL_MS)
 
@@ -1959,6 +1984,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._btn_start_flight.setText("开始飞行")
         self._flight_aircraft_combo.setEnabled(True)
+        self._btn_formation.setEnabled(True)
         self._btn_save_flight.setEnabled(True)
         self._btn_load_flight.setEnabled(True)
 
@@ -2043,7 +2069,10 @@ class MainWindow(QtWidgets.QMainWindow):
         return {"pos": pos, "yaw": yaw, "pitch": pitch, "roll": roll}
 
     def _apply_flight_state(self, state):
-        """Apply a flight state dict to the aircraft actor(s) + UI sliders."""
+        """Apply a flight state dict to the aircraft actor(s) + UI sliders.
+
+        In formation mode, also updates all followers relative to the leader.
+        """
         if state is None:
             return
         name = self._flight_aircraft
@@ -2052,7 +2081,7 @@ class MainWindow(QtWidgets.QMainWindow):
         pitch = state["pitch"]
         roll = state["roll"]
 
-        # Update transform
+        # Update leader transform
         if name in self._obj_transforms:
             self._obj_transforms[name]["offset"] = pos.tolist()
             self._obj_transforms[name]["yaw"] = yaw
@@ -2069,6 +2098,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Apply to VTK actor on main window
         self._apply_obj_transform_to_actor(name)
+
+        # Update formation followers relative to leader (ID-27)
+        aircraft_list = getattr(self, '_flight_aircraft_list', [])
+        if len(aircraft_list) > 1:
+            for fname in aircraft_list[1:]:
+                offset = self._formation_offsets.get(fname)
+                if offset is not None and fname in self._obj_transforms:
+                    self._obj_transforms[fname]["offset"] = (pos + offset).tolist()
+                    self._apply_obj_transform_to_actor(fname)
 
     def _flight_tick(self):
         """Single animation step called by the flight timer."""
