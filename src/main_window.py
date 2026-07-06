@@ -1935,9 +1935,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         cache = {
             "aircraft_name": name,
-            "formation": selected,  # all aircraft in formation (ID-27)
-            "start_position": aircraft_wps[0],
-            "waypoints": [wp.tolist() for wp in aircraft_wps],
+            "formation": selected,
+            "start_position": list(aircraft_wps[0]),
+            "waypoints": [list(wp) for wp in aircraft_wps],
             "segments": segments,
             "interval_ms": self.FLIGHT_INTERVAL_MS,
         }
