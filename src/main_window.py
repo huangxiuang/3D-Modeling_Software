@@ -2188,11 +2188,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
                 return
 
+        # ── Convert numpy arrays to plain Python lists for JSON serialization ──
+        def _to_py(val):
+            if isinstance(val, np.ndarray):
+                return val.tolist()
+            if isinstance(val, list):
+                return [_to_py(v) for v in val]
+            return val
+
         data = {
             "aircraft_name": cache["aircraft_name"],
             "formation": cache.get("formation", [cache["aircraft_name"]]),
-            "start_position": cache["start_position"],
-            "waypoints": cache["waypoints"],
+            "start_position": _to_py(cache["start_position"]),
+            "waypoints": _to_py(cache["waypoints"]),
             "segments": segments,
             "interval_ms": cache["interval_ms"],
             "description": (
@@ -2200,16 +2208,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 "segments[i] contains yaw/pitch/roll for travel from 'from' to 'to'."
             ),
         }
-        with open(name, "w") as f:
-            json.dump(data, f, indent=2)
+        try:
+            with open(name, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "保存失败", f"写入 JSON 文件时出错:\n{e}")
+            return
 
         # ── Save companion 3D scatter plot ──
         if _HAS_MPL:
             try:
                 fig = plt.figure(figsize=(10, 8))
                 ax = fig.add_subplot(111, projection="3d")
-                wps = cache["waypoints"]
-                all_pts = [cache["start_position"]] + wps
+                wps = data["waypoints"]
+                all_pts = [data["start_position"]] + wps
                 xs = [p[0] for p in all_pts]
                 ys = [p[1] for p in all_pts]
                 zs = [p[2] for p in all_pts]
@@ -2220,7 +2232,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 ax.set_xlabel("X")
                 ax.set_ylabel("Y")
                 ax.set_zlabel("Z")
-                ax.set_title(f'Flight Path: {cache["aircraft_name"]}')
+                ax.set_title(f'Flight Path: {data["aircraft_name"]}')
                 ax.legend()
                 png_path = name.replace(".json", "_3dplot.png")
                 fig.savefig(png_path, dpi=150, bbox_inches="tight")
