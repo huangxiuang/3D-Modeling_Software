@@ -2308,6 +2308,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if start_pos is not None and saved_wps and saved_wps[0] == list(start_pos):
             saved_wps = saved_wps[1:]  # old format: strip duplicate start
         self._flight_path = [np.array(p) for p in [start_pos] + saved_wps]
+        self._flight_active = True
+        self._flight_aircraft = name
+        self._flight_segments = segments
+        self._flight_segment_idx = 0
+        self._flight_step = 0
+        self._flight_steps_per_segment = segments[0].get("steps", 50)
+        self._flight_data_cache = data
 
         # Timeline state (ID-20)
         self._total_flight_steps = total_steps
