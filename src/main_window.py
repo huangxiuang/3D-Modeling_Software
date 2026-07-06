@@ -1937,7 +1937,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "aircraft_name": name,
             "formation": selected,
             "start_position": list(aircraft_wps[0]),
-            "waypoints": [list(wp) for wp in aircraft_wps],
+            "waypoints": [list(wp) for wp in aircraft_wps[1:]],  # exclude start (stored above)
             "segments": segments,
             "interval_ms": self.FLIGHT_INTERVAL_MS,
         }
@@ -2289,10 +2289,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         interval_ms = data.get("interval_ms", 50)
 
-        # Rebuild waypoints from the data for visual reference
-        saved_wps = data.get("waypoints", [])
-        # Don't modify self.waypoints — just replay the animation
-
         # Start flight with loaded segments
         t = self._get_or_init_transform(name)
         start_pos = data.get("start_position", t["offset"])
@@ -2306,14 +2302,12 @@ class MainWindow(QtWidgets.QMainWindow):
         total_steps = sum(seg["steps"] for seg in segments)
         total_time_ms = total_steps * interval_ms
 
-        self._flight_active = True
-        self._flight_aircraft = name
+        # Build flight path: start_position + waypoints (backward compat)
+        # Old saved files have waypoints including start_position — deduplicate.
+        saved_wps = data.get("waypoints", [])
+        if start_pos is not None and saved_wps and saved_wps[0] == list(start_pos):
+            saved_wps = saved_wps[1:]  # old format: strip duplicate start
         self._flight_path = [np.array(p) for p in [start_pos] + saved_wps]
-        self._flight_segments = segments
-        self._flight_segment_idx = 0
-        self._flight_step = 0
-        self._flight_steps_per_segment = segments[0].get("steps", 50)
-        self._flight_data_cache = data
 
         # Timeline state (ID-20)
         self._total_flight_steps = total_steps
