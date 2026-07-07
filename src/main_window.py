@@ -3,9 +3,12 @@ MainWindow — top-level QMainWindow integrating all UI, scene, and tool subsyst
 
 Key design decisions
 --------------------
-* Mouse events are captured at the **Qt** level (``ClickablePlotter``), *not* via
-  VTK observers.  PyVista's ``RenderWindowInteractor`` wrapper does not
-  propagate VTK observers when used inside ``QVTKRenderWindowInteractor``.
+* Click detection uses a VTK observer (``LeftButtonPressEvent``) for press
+  position and ``GetEventPosition()`` after ``super().mouseReleaseEvent()`` for
+  release position — both give VTK-native display coordinates directly,
+  avoiding fragile Qt‑to‑VTK conversion.
+* World picking uses ``vtkHardwarePicker`` (GPU, pixel‑perfect) with
+  ``vtkCellPicker`` fallback — never ``vtkWorldPointPicker``.
 * Scene objects are initialised *before* the UI so docks and trees populate
   correctly on first render.
 * Object transforms (position, scale) use VTK's ``UserTransform`` so mesh data
@@ -47,6 +50,12 @@ from src.interaction import InteractionMode
 from src.scene_builder import build_default_scene
 from src.measurement import MeasurementTool
 from src.collision import find_collisions
+from src.dem_loader import (
+    load_dem,
+    build_dem_scene,
+    HAS_RASTERIO,
+    AIRCRAFT_DEFAULT_SCALE,
+)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -54,51 +63,39 @@ from src.collision import find_collisions
 # ═══════════════════════════════════════════════════════════════
 
 class ClickablePlotter(pvqt.QtInteractor):
-    """``QtInteractor`` subclass that captures mouse events at the Qt level.
-
-    PyVista's ``RenderWindowInteractor`` wrapper does **not** deliver
-    VTK observer callbacks for mouse events (``add_observer`` registers
-    successfully but callbacks never fire).  We work around this by
-    intercepting events in Qt's event system before they reach VTK.
+    """``QtInteractor`` subclass with reliable world picking.
 
     Click detection
     ---------------
     A "click" is defined as a left-button press followed by a release
     within 5 screen pixels and 0.5 seconds (i.e. not a drag intended
-    for camera orbit).  The click callback receives screen coordinates,
-    the world position (via ``vtkPropPicker``), and the hit
-    ``vtkActor`` (or ``None``).
+    for camera orbit).  The click callback receives VTK display
+    coordinates, the world position (via ``vtkHardwarePicker``), and
+    the hit ``vtkActor`` (or ``None``).
 
-    Camera controls are preserved by calling ``super().*Event()`` so
-    VTK still processes drags normally.
+    World position accuracy
+    -----------------------
+    Uses ``vtkHardwarePicker`` (GPU pixel-level, zero tolerance) as
+    primary, ``vtkCellPicker`` as secondary, ``vtkWorldPointPicker``
+    as last resort.  ``_snap_to_terrain`` refines Z via vertical ray
+    intersection with the terrain mesh.
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMouseTracking(True)
-        self._press_pos = None          # (x, y) at press
+        self._press_pos = None          # (x, y) at press (Qt widget coords)
         self._press_time = 0.0
-        self.click_callback = None      # f(x, y, world_pos, vtkActor)
+        self.click_callback = None      # f(vtk_x, vtk_y, world_pos, vtkActor)
         self.move_callback = None       # f(x, y, world_pos)
 
-    def _to_vtk_display(self, qt_x, qt_y):
-        """Convert Qt widget coords → VTK display coords (pixels, bottom-left origin).
-
-        Qt origin is top-left, VTK display origin is bottom-left.
-        Must also scale by device pixel ratio for Retina/HiDPI displays.
-        The parent ``QVTKRenderWindowInteractor._setEventInformation`` does the
-        same conversion internally — this must match it exactly.
-        """
-        scale = QtWidgets.QApplication.instance().devicePixelRatio()
-        win_size = self.renderer.GetRenderWindow().GetSize()
-        vtk_x = int(round(qt_x * scale))
-        vtk_y = win_size[1] - int(round(qt_y * scale)) - 1
-        return vtk_x, vtk_y
+    # ── Qt event overrides ──────────────────────────
 
     def mousePressEvent(self, event):
         if event.button() == QtCore.Qt.LeftButton:
             self._press_pos = (event.pos().x(), event.pos().y())
             self._press_time = time.time()
+            print(f"[DEBUG] mousePressEvent: press_pos={self._press_pos}", flush=True)
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event):
@@ -107,6 +104,7 @@ class ClickablePlotter(pvqt.QtInteractor):
             dx = rx - self._press_pos[0]
             dy = ry - self._press_pos[1]
             dt = time.time() - self._press_time
+            print(f"[DEBUG] mouseReleaseEvent: press={self._press_pos} release=({rx},{ry}) delta=({dx},{dy}) dt={dt:.3f}", flush=True)
             if dx * dx + dy * dy < 25 and dt < 0.5:
                 self._process_click(rx, ry)
         self._press_pos = None
@@ -120,26 +118,41 @@ class ClickablePlotter(pvqt.QtInteractor):
 
     # ── Internal click processing ───────────────────
 
+    def _to_vtk_display(self, qt_x, qt_y):
+        """Convert Qt widget coords → VTK display coords (pixels, bottom-left origin).
+
+        Qt origin is top-left, VTK display origin is bottom-left.
+        Must also scale by device pixel ratio for Retina/HiDPI displays.
+        The parent ``QVTKRenderWindowInteractor._setEventInformation`` does the
+        same conversion internally — this must match it exactly.
+
+        QVTK's ``_setEventInformation`` computes::
+
+            vtk_y = round((self.height() - y - 1) * scale)
+
+        whereas an earlier version of this method used ``win_height -
+        round(y*scale) - 1``, which differs by (scale−1) pixels on Retina.
+        """
+        scale = QtWidgets.QApplication.instance().devicePixelRatio()
+        vtk_x = int(round(qt_x * scale))
+        vtk_y = int(round((self.height() - qt_y - 1) * scale))
+        return vtk_x, vtk_y
+
     def _process_click(self, x, y):
         if self.click_callback is None:
             return
         vtk_x, vtk_y = self._to_vtk_display(x, y)
-
-        # Use vtkCellPicker for accurate surface intersection (more precise
-        # than PropPicker's prop-level pick, especially with overlaid layers).
         picker = vtk.vtkCellPicker()
         picker.SetTolerance(0.001)
         if picker.Pick(vtk_x, vtk_y, 0, self.renderer) and picker.GetCellId() >= 0:
             world = np.array(picker.GetPickPosition())
             actor = picker.GetActor()
         else:
-            # Fallback: ray-terrain intersection via PropPicker on visible props
             pp = vtk.vtkPropPicker()
             if pp.Pick(vtk_x, vtk_y, 0, self.renderer):
                 world = np.array(pp.GetPickPosition())
                 actor = pp.GetActor()
             else:
-                # Last resort: focal-plane pick (Z will be wrong, but XY roughly match)
                 wp = vtk.vtkWorldPointPicker()
                 wp.Pick(vtk_x, vtk_y, 0, self.renderer)
                 world = np.array(wp.GetPickPosition())
@@ -201,6 +214,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._frame_count = 0
         self._rec_dir = ""
 
+        # DEM scene flag (set by _import_dem_model, used to distinguish from default scene)
+        self._dem_scene_active = False
+
         # River animation
         self._flowing = True
 
@@ -228,6 +244,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._flight_aircraft = ""
         self._flight_aircraft_list = []  # all aircraft in current flight (ID-27)
         self._flight_data_cache = None  # saved for later export
+        self._flight_camera_follow = False  # camera auto-track aircraft on flight
 
         # Per-aircraft waypoints (ID-20)
         self._aircraft_waypoints = {}   # name → list of waypoints (shared path attribute)
@@ -424,7 +441,7 @@ class MainWindow(QtWidgets.QMainWindow):
         fm.addAction("截图...", self._take_screenshot)
         fm.addAction("连续截图 (录制) 开/关", self._toggle_recording)
         fm.addSeparator()
-        fm.addAction("导入模型 (STL/OBJ)...", self._import_model)
+        fm.addAction("导入 DEM 模型 (HFA/GeoTIFF)...", self._import_dem_model)
         fm.addAction("导出选中模型...", self._export_selected)
         fm.addSeparator()
         fm.addAction("退出", self.close)
@@ -471,6 +488,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 lambda checked, c=cs: self._set_coord_system(c),
             )
 
+        # ── Layer management ──
+        lm = mb.addMenu("图层 (&L)")
+        lm.addAction("增加图层...", self._open_layer_dialog)
+        lm.addAction("图层管理...", self._open_layer_manager)
+
         # ── Help ──
         hm = mb.addMenu("帮助 (&H)")
         hm.addAction("关于", self._show_about)
@@ -478,6 +500,39 @@ class MainWindow(QtWidgets.QMainWindow):
         # Register for mode-button syncing
         self._mode_buttons.append((self._action_meas_dist, InteractionMode.MEASURE_DISTANCE))
         self._mode_buttons.append((self._action_meas_angle, InteractionMode.MEASURE_ANGLE))
+
+    def _build_layer_menu_action(self, layer_key, layer_label):
+        """Build a QWidgetAction embedding a checkbox + opacity slider for *layer_key*.
+
+        This preserves the same two-control layout (visibility toggle +
+        transparency slider) that the dock panel provided, now inside the
+        Layer menu.
+        """
+        widget = QtWidgets.QWidget()
+        lo = QtWidgets.QHBoxLayout(widget)
+        lo.setContentsMargins(4, 1, 4, 1)
+        lo.setSpacing(4)
+
+        chk = QtWidgets.QCheckBox(layer_label)
+        info = self.scene_objects.get(layer_key, {})
+        chk.setChecked(info.get("visible", True))
+        chk.toggled.connect(
+            lambda checked, n=layer_key: self._toggle_terrain_layer(n, checked)
+        )
+        lo.addWidget(chk)
+        self._terrain_chks[layer_key] = chk
+
+        slider_w, slider_setter = self._create_opacity_slider(
+            0.0,
+            lambda val, n=layer_key: self._on_terrain_opacity(n, val),
+        )
+        lo.addWidget(slider_w)
+        self._terrain_opacity_sliders[layer_key] = slider_w
+        self._terrain_opacity_setters[layer_key] = slider_setter
+
+        act = QtWidgets.QWidgetAction(self)
+        act.setDefaultWidget(widget)
+        return act
 
     # ── Toolbar ─────────────────────────────────────
 
@@ -521,44 +576,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # ── Docks ───────────────────────────────────────
 
     def _setup_docks(self):
-        # ── Left: 图层管理 (layer mgmt, ID-18) ──
-        dock_layers = QtWidgets.QDockWidget("图层管理", self)
-        lm_widget = QtWidgets.QWidget()
-        lm_layout = QtWidgets.QVBoxLayout(lm_widget)
-        lm_layout.setContentsMargins(4, 4, 4, 4)
-        lm_layout.setSpacing(3)
-
-        # Transparency explanation: left=opaque, right=transparent
-        hint = QtWidgets.QLabel("← 实心 ── 完全透明 →")
-        hint.setStyleSheet("color: #888; font-size: 11px; padding: 0 4px;")
-        hint.setAlignment(Qt.AlignRight)
-        lm_layout.addWidget(hint)
-
-        for layer_key, layer_label in self._terrain_layer_names.items():
-            row = QtWidgets.QHBoxLayout()
-            row.setSpacing(4)
-            chk = QtWidgets.QCheckBox(layer_label)
-            info = self.scene_objects.get(layer_key, {})
-            chk.setChecked(info.get("visible", True))
-            chk.toggled.connect(
-                lambda checked, n=layer_key: self._toggle_terrain_layer(n, checked)
-            )
-            row.addWidget(chk)
-            self._terrain_chks[layer_key] = chk
-
-            slider_w, slider_setter = self._create_opacity_slider(
-                0.0,
-                lambda val, n=layer_key: self._on_terrain_opacity(n, val),
-            )
-            row.addWidget(slider_w)
-            self._terrain_opacity_sliders[layer_key] = slider_w
-            self._terrain_opacity_setters[layer_key] = slider_setter
-
-            lm_layout.addLayout(row)
-
-        dock_layers.setWidget(lm_widget)
-
-        # ── Left: 场景对象显隐 ──
+        # ── Left: 场景对象显隐 (layer mgmt moved to menu bar per ID-29) ──
         dock_so = QtWidgets.QDockWidget("场景对象", self)
         so_widget = QtWidgets.QWidget()
         so_layout = QtWidgets.QVBoxLayout(so_widget)
@@ -572,8 +590,7 @@ class MainWindow(QtWidgets.QMainWindow):
         so_layout.addStretch()
         dock_so.setWidget(so_widget)
 
-        # Register right-side docks (图层管理 above 场景对象 above 对象控制)
-        self.addDockWidget(Qt.RightDockWidgetArea, dock_layers)
+        # Register right-side docks
         self.addDockWidget(Qt.RightDockWidgetArea, dock_so)
 
         # ── Left: 路径规划 ──
@@ -612,6 +629,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_start_flight = QtWidgets.QPushButton("开始飞行")
         self._btn_start_flight.clicked.connect(self._start_flight)
         pl.addWidget(self._btn_start_flight)
+
+        self._chk_camera_follow = QtWidgets.QCheckBox("相机自动跟随")
+        self._chk_camera_follow.setChecked(False)
+        self._chk_camera_follow.toggled.connect(
+            lambda checked: setattr(self, '_flight_camera_follow', checked)
+        )
+        pl.addWidget(self._chk_camera_follow)
 
         flight_save_row = QtWidgets.QHBoxLayout()
         self._btn_save_flight = QtWidgets.QPushButton("保存飞行数据")
@@ -735,29 +759,59 @@ class MainWindow(QtWidgets.QMainWindow):
     def _make_slider(vmin, vmax, initial, callback, steps=1000):
         """Create a horizontal slider with live value label.
 
+        Stores ``vmin``/``vmax`` as attributes on the returned widget so
+        the range can be updated dynamically via ``_update_slider_range``.
+
         Returns the container widget (use ``.findChild(QtWidgets.QSlider)``
         to access the slider if needed).
         """
         w = QtWidgets.QWidget()
+        w._slider_vmin = vmin
+        w._slider_vmax = vmax
+        w._slider_steps = steps
+        w._slider_callback = callback
         lo = QtWidgets.QHBoxLayout(w)
         lo.setContentsMargins(0, 0, 0, 0)
         s = QtWidgets.QSlider(Qt.Horizontal)
         s.setRange(0, steps)
-        frac = (initial - vmin) / (vmax - vmin)
+        frac = (initial - vmin) / (vmax - vmin) if (vmax - vmin) != 0 else 0.0
         s.setValue(int(frac * steps))
         label = QtWidgets.QLabel(f"{initial:.2f}")
-        label.setMinimumWidth(45)
+        label.setMinimumWidth(60)
         lo.addWidget(s, 1)
         lo.addWidget(label)
 
         def on_change(val):
-            f = val / float(steps)
-            real = vmin + f * (vmax - vmin)
+            f = val / float(w._slider_steps)
+            vmin_cur = w._slider_vmin
+            vmax_cur = w._slider_vmax
+            real = vmin_cur + f * (vmax_cur - vmin_cur)
             label.setText(f"{real:.2f}")
-            callback(real)
+            w._slider_callback(real)
 
         s.valueChanged.connect(on_change)
         return w
+
+    def _update_slider_range(self, slider_widget, vmin, vmax):
+        """Change the range of a slider made by ``_make_slider`` in-place."""
+        slider_widget._slider_vmin = vmin
+        slider_widget._slider_vmax = vmax
+        s = slider_widget.findChild(QtWidgets.QSlider)
+        if s is None:
+            return
+        # Keep current value within new range
+        label = slider_widget.findChild(QtWidgets.QLabel)
+        try:
+            val = float(label.text())
+        except (ValueError, AttributeError):
+            val = 0.0
+        val = max(vmin, min(vmax, val))
+        frac = (val - vmin) / (vmax - vmin) if (vmax - vmin) != 0 else 0.0
+        s.blockSignals(True)
+        s.setValue(int(frac * slider_widget._slider_steps))
+        s.blockSignals(False)
+        if label:
+            label.setText(f"{val:.2f}")
 
     def _slider_value(self, slider_widget):
         """Read the current float value from a slider widget made by ``_make_slider``."""
@@ -887,16 +941,27 @@ class MainWindow(QtWidgets.QMainWindow):
                 w.deleteLater()
 
         terrain_names = set(self._terrain_layer_names.keys())
+        is_dem = self._is_dem_scene()
         scene_items = []
-        for name in self.scene_objects:
-            if name == "terrain" or name in terrain_names:
-                continue
-            label = name
-            if name.startswith("layer_"):
-                continue
-            scene_items.append((name, label, False))
-        for name in self.custom_objects:
-            scene_items.append((name, name, True))
+
+        if is_dem:
+            # DEM mode: only aircraft, aircraft2, terrain
+            for name in ["aircraft", "aircraft2", "terrain"]:
+                if name in self.scene_objects:
+                    scene_items.append((name, name, False))
+        else:
+            for name in self.scene_objects:
+                if name == "terrain" or name in terrain_names:
+                    if name in ("river", "vegetation"):
+                        label = self._terrain_layer_names.get(name, name)
+                        scene_items.append((name, label, False))
+                    continue
+                label = name
+                if name.startswith("layer_"):
+                    continue
+                scene_items.append((name, label, False))
+            for name in self.custom_objects:
+                scene_items.append((name, name, True))
 
         if not scene_items:
             lbl = QtWidgets.QLabel("(无场景对象)")
@@ -915,12 +980,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 chk.setChecked(name in self.plotter_actors)
                 new_custom_chks[name] = chk
                 chk.toggled.connect(lambda checked, n=name: self._toggle_custom(n, checked))
+                row.addWidget(chk)
+                row.addStretch()
+            elif name in ("river", "vegetation"):
+                chk.setChecked(info.get("visible", True) if info else True)
+                new_chks[name] = chk
+                chk.toggled.connect(lambda checked, n=name: self._toggle_terrain_layer(n, checked))
+                row.addWidget(chk)
+                row.addStretch()
             else:
                 chk.setChecked(info.get("visible", True) if info else True)
                 new_chks[name] = chk
                 chk.toggled.connect(lambda checked, n=name: self._toggle_layer(n, checked))
-            row.addWidget(chk)
-            row.addStretch()
+                row.addWidget(chk)
+                row.addStretch()
             lo.insertLayout(lo.count() - 1, row)
 
         self._scene_obj_chks = new_chks
@@ -962,6 +1035,171 @@ class MainWindow(QtWidgets.QMainWindow):
     #  Layer / tree panels
     # ═══════════════════════════════════════════════════════════════
 
+    def _open_layer_dialog(self):
+        """Open the Layer Management dialog for shape-based layer editing."""
+        if not _HAS_MPL:
+            QtWidgets.QMessageBox.warning(
+                self, "提示",
+                "图层管理需要 matplotlib 支持。\n请安装: pip install matplotlib"
+            )
+            return
+        try:
+            from src.layer_dialog import LayerManagementDialog
+        except ImportError:
+            QtWidgets.QMessageBox.warning(
+                self, "错误",
+                "无法加载图层管理模块 (src/layer_dialog.py)"
+            )
+            return
+
+        is_dem = self._is_dem_scene()
+        extent = self._compute_terrain_extent()
+        dlg = LayerManagementDialog(
+            self,
+            layer_names=dict(self._terrain_layer_names),
+            terrain_extent=extent,
+            is_dem_scene=is_dem,
+        )
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+
+        results = dlg.get_results()
+
+        shapes_by_layer = results.get("layer_shapes", {})
+
+        # Apply layer visibility toggles (skip layers that get shape clips)
+        for key, visible in results.get("layer_visibility", {}).items():
+            if key in shapes_by_layer:
+                continue
+            if key in self.scene_objects:
+                self._toggle_terrain_layer(key, visible)
+
+        # Apply new shape-based layers and hide the source layer
+        if shapes_by_layer:
+            self._apply_layer_shapes(shapes_by_layer)
+            for key in shapes_by_layer:
+                if key in self.scene_objects:
+                    self._toggle_terrain_layer(key, False)
+
+        self.plotter.render()
+
+    def _open_layer_manager(self):
+        """Open the Clip Manager dialog to manage extracted clip layers."""
+        if not _HAS_MPL:
+            QtWidgets.QMessageBox.warning(
+                self, "提示",
+                "图层管理需要 matplotlib 支持。\n请安装: pip install matplotlib"
+            )
+            return
+        try:
+            from src.layer_dialog import ClipManagerDialog
+        except ImportError:
+            QtWidgets.QMessageBox.warning(
+                self, "错误",
+                "无法加载图层管理模块 (src/layer_dialog.py)"
+            )
+            return
+
+        dlg = ClipManagerDialog(
+            self,
+            scene_objects=self.scene_objects,
+            plotter_actors=self.plotter_actors,
+            toggle_fn=self._toggle_terrain_layer,
+            opacity_fn=self._on_terrain_opacity,
+            remove_fn=self._remove_clip_layer,
+            rebuild_fn=self._rebuild_actor,
+        )
+        dlg.exec_()
+
+    def _remove_clip_layer(self, name):
+        self._remove_actor(name)
+        self.scene_objects.pop(name, None)
+        self._obj_transforms.pop(name, None)
+        self._terrain_chks.pop(name, None)
+        self._terrain_opacity_setters.pop(name, None)
+        self.plotter.render()
+
+    _CLIP_LAYER_PARAMS = {
+        "layer_sand":  {"color": "#e8c76a", "smooth_shading": True, "opacity": 1.0},
+        "layer_grass": {"color": "#5a9e4c", "smooth_shading": True, "opacity": 1.0},
+        "layer_earth": {"color": "#8b6f47", "smooth_shading": True, "opacity": 1.0},
+    }
+
+    def _apply_layer_shapes(self, shapes_by_layer):
+        """Extract sub-meshes from the terrain surface based on XY shapes.
+
+        Instead of clipping the elevation-thresholded layer mesh (which would
+        limit the result to wherever that layer naturally occurs), this clips
+        the full terrain surface and colours it with the target layer's
+        parameters.  This way the polygon defines the *extent* of the layer.
+        """
+        terrain_info = self.scene_objects.get("terrain")
+        if terrain_info is None:
+            return
+        grid = terrain_info["mesh"]
+        surface = grid.extract_surface()
+
+        from matplotlib.path import Path
+        surface_pts = np.array(surface.points)
+
+        z_off = max((surface_pts[:, 2].max() - surface_pts[:, 2].min()) * 0.005, 0.01)
+
+        for layer_key, shapes in shapes_by_layer.items():
+            if not shapes:
+                continue
+
+            if layer_key in self.scene_objects:
+                layer_params = self.scene_objects[layer_key]["params"]
+            else:
+                layer_params = self._CLIP_LAYER_PARAMS.get(layer_key)
+                if layer_params is None:
+                    continue
+
+            combined_mask = np.zeros(len(surface_pts), dtype=bool)
+
+            for shape in shapes:
+                poly = np.array(shape["xy"])
+                if len(poly) < 3:
+                    continue
+                path = Path(poly)
+                mask = path.contains_points(surface_pts[:, :2])
+                combined_mask |= mask
+
+            if not combined_mask.any():
+                continue
+
+            sub_mesh = surface.extract_points(combined_mask)
+            if not sub_mesh.n_points:
+                continue
+
+            sub_mesh.translate((0, 0, z_off), inplace=True)
+
+            clip_name = f"{layer_key}_clip"
+            idx = 1
+            while clip_name in self.scene_objects:
+                clip_name = f"{layer_key}_clip_{idx}"
+                idx += 1
+
+            opacity = shapes[0].get("opacity", 1.0)
+            base_color = layer_params.get("color") or (
+                layer_params.get("cmap") and layer_params["cmap"][len(layer_params["cmap"]) // 2]
+            ) or self._CLIP_LAYER_PARAMS.get(layer_key, {}).get("color", "#888888")
+            clip_params = {
+                "color": base_color,
+                "smooth_shading": True,
+                "opacity": opacity,
+            }
+            self.scene_objects[clip_name] = {
+                "mesh": sub_mesh,
+                "type": "mesh",
+                "visible": True,
+                "params": clip_params,
+                "extra": None,
+                "name": clip_name,
+            }
+            self._add_actor(clip_name, self.scene_objects[clip_name])
+            self.scene_objects[clip_name]["visible"] = True
+
     def _refresh_ui(self):
         """Refresh flight combo, terrain UI, and scene-object checkboxes."""
         self._refresh_obj_combo()
@@ -970,17 +1208,38 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_scene_objects_ui()
 
     def _refresh_obj_combo(self):
-        """Rebuild the object-control combo box."""
+        """Rebuild the object-control combo box.
+
+        In DEM scenes (detected by presence of 'X'/'Y' in terrain extra),
+        only show aircraft, aircraft2, terrain — in that order.
+        Default selection is aircraft1.
+        """
         current = self._obj_combo.currentText()
         self._obj_combo.blockSignals(True)
         self._obj_combo.clear()
-        for name in self.scene_objects:
-            self._obj_combo.addItem(name)
-        for name in self.custom_objects:
-            self._obj_combo.addItem(f"[自定义] {name}")
+
+        is_dem = self._is_dem_scene()
+
+        if is_dem:
+            # DEM mode: ordered list with only aircraft, aircraft2, terrain
+            priority = ["aircraft", "aircraft2", "terrain"]
+            for name in priority:
+                if name in self.scene_objects:
+                    self._obj_combo.addItem(name)
+        else:
+            for name in self.scene_objects:
+                self._obj_combo.addItem(name)
+            for name in self.custom_objects:
+                self._obj_combo.addItem(f"[自定义] {name}")
+
         idx = self._obj_combo.findText(current)
         if idx >= 0:
             self._obj_combo.setCurrentIndex(idx)
+        elif is_dem:
+            # Default to aircraft1 in DEM mode
+            ac_idx = self._obj_combo.findText("aircraft")
+            if ac_idx >= 0:
+                self._obj_combo.setCurrentIndex(ac_idx)
         self._obj_combo.blockSignals(False)
 
 
@@ -1059,22 +1318,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_obj_transform_to_actor(clean_name)
 
     def _set_slider_value(self, slider_widget, val):
-        """Set a slider widget to a given value without triggering its callback."""
         s = slider_widget.findChild(QtWidgets.QSlider)
         if s is None:
             return
         s.blockSignals(True)
-        vmin, vmax = -15, 15  # default range, will be overridden per slider
-        if slider_widget is self._slider_obj_s:
-            vmin, vmax = 0.1, 5.0
-        elif slider_widget is self._slider_obj_yaw:
-            vmin, vmax = 0.0, 360.0
-        elif slider_widget is self._slider_obj_pitch:
-            vmin, vmax = -90.0, 90.0
-        elif slider_widget is self._slider_obj_roll:
-            vmin, vmax = -180.0, 180.0
-        frac = (val - vmin) / (vmax - vmin)
-        s.setValue(int(frac * 1000))
+        vmin = getattr(slider_widget, '_slider_vmin', -15)
+        vmax = getattr(slider_widget, '_slider_vmax', 15)
+        steps = getattr(slider_widget, '_slider_steps', 1000)
+        frac = (val - vmin) / (vmax - vmin) if (vmax - vmin) != 0 else 0.0
+        s.setValue(int(frac * steps))
         s.blockSignals(False)
         label = slider_widget.findChild(QtWidgets.QLabel)
         if label:
@@ -1220,7 +1472,6 @@ class MainWindow(QtWidgets.QMainWindow):
         mode = self._current_mode
 
         if mode == InteractionMode.NORMAL:
-            # Object selection
             if vtk_actor is not None:
                 name = self._get_name_from_vtk_actor(vtk_actor)
                 if name:
@@ -1293,8 +1544,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_view(self, direction):
         p = self.plotter
-        fp = p.camera.focal_point
-        dist = 25
+        extent = self._compute_terrain_extent()
+        xy_half, z_half = extent
+        dist = max(xy_half * 2.5, 25.0)
+        fp = (0, 0, z_half * 0.5)
         views = {
             "top":    ((0, 0, dist), (0, 0, 0), (0, 1, 0)),
             "bottom": ((0, 0, -dist), (0, 0, 0), (0, 1, 0)),
@@ -1303,13 +1556,34 @@ class MainWindow(QtWidgets.QMainWindow):
         }
         if direction in views:
             p.camera_position = views[direction]
+            p.camera.focal_point = fp
             p.render()
 
     def _reset_camera(self):
         """Reset only the camera to default position (ID-7)."""
         p = self.plotter
-        p.camera_position = [(18, -16, 8), (0, 0, 2), (0, 0, 1)]
-        p.camera.focal_point = (0, 0, 1.5)
+        extent = self._compute_terrain_extent()
+        xy_half, z_half = extent
+        dist = max(xy_half * 2.5, 25.0)
+        mid_z = z_half * 0.5
+        p.camera_position = [(dist * 0.6, -dist * 0.5, dist * 0.4),
+                             (0, 0, mid_z), (0, 0, 1)]
+        p.camera.focal_point = (0, 0, mid_z)
+        p.render()
+
+    def _focus_camera_on_aircraft(self, pos, yaw_deg=0.0):
+        """Position camera in tail-chase view behind and above the aircraft."""
+        p = self.plotter
+        extent = self._compute_terrain_extent()
+        xy_half, z_half = extent
+        dist = max(xy_half * 0.8, 50.0)
+        # Behind the aircraft based on heading
+        yaw_rad = math.radians(yaw_deg)
+        behind_x = -math.cos(yaw_rad) * dist
+        behind_y = -math.sin(yaw_rad) * dist
+        above_z = dist * 0.4
+        cam_pos = (pos[0] + behind_x, pos[1] + behind_y, pos[2] + above_z)
+        p.camera_position = [cam_pos, (pos[0], pos[1], pos[2]), (0, 0, 1)]
         p.render()
 
     def _reset_all(self):
@@ -1460,6 +1734,11 @@ class MainWindow(QtWidgets.QMainWindow):
             "objects": scene_transforms,
         }
 
+        # For DEM scenes, also save X, Y coordinate grids for proper reconstruction
+        if "X" in extra and "Y" in extra:
+            terrain_data["X"] = extra["X"].tolist()
+            terrain_data["Y"] = extra["Y"].tolist()
+
         terrain_path = os.path.join(terrain_dir, f"{name}.json")
         with open(terrain_path, "w") as f:
             json.dump(terrain_data, f, indent=2, ensure_ascii=False)
@@ -1480,9 +1759,9 @@ class MainWindow(QtWidgets.QMainWindow):
         aircraft_dir = os.path.join(base_dir, "..", self.SAVE_DIR_AIRCRAFT)
         terrain_dir = os.path.join(base_dir, "..", self.SAVE_DIR_TERRAIN)
 
-        if not os.path.isdir(data_dir):
-            QtWidgets.QMessageBox.warning(self, "错误", f"数据目录不存在: {data_dir}")
-            return
+        # Create directories if not exist so user can navigate there
+        os.makedirs(aircraft_dir, exist_ok=True)
+        os.makedirs(terrain_dir, exist_ok=True)
 
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "载入数据 (选择 aircraft 或 terrain JSON)", data_dir, "JSON (*.json)"
@@ -1497,7 +1776,11 @@ class MainWindow(QtWidgets.QMainWindow):
         abs_aircraft_dir = os.path.abspath(aircraft_dir)
         abs_terrain_dir = os.path.abspath(terrain_dir)
 
-        if path_dir == abs_aircraft_dir:
+        if "aircraft" in os.path.basename(path_dir).lower():
+            self._load_aircraft_data(path, base_name)
+        elif "terrain" in os.path.basename(path_dir).lower():
+            self._load_terrain_data(path, base_name)
+        elif path_dir == abs_aircraft_dir:
             self._load_aircraft_data(path, base_name)
         elif path_dir == abs_terrain_dir:
             self._load_terrain_data(path, base_name)
@@ -1537,20 +1820,45 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "错误", f"加载地形数据失败: {e}")
             return
 
+        # Check if this is DEM terrain data (has X, Y grids)
+        has_dem_grid = "X" in terrain_data and "Y" in terrain_data
+
         # Restore terrain mesh elevation
         terrain_info = self.scene_objects.get("terrain")
         if terrain_info is not None:
-            mesh = terrain_info["mesh"]
             extra = terrain_info["extra"]
             Z_2d = np.array(terrain_data["original_z"])
-            extra["original_z"] = Z_2d
 
-            pts = mesh.points
-            pts[:, 2] = Z_2d.flatten(order="F")
-            mesh.points = pts
-            mesh["elevation"] = Z_2d.flatten(order="F")
-            self._rebuild_actor("terrain")
-            self._rebuild_terrain_layers()
+            if has_dem_grid and extra is not None:
+                # DEM scene: reconstruct StructuredGrid from saved X, Y, Z
+                X_2d = np.array(terrain_data["X"])
+                Y_2d = np.array(terrain_data["Y"])
+                rows, cols = Z_2d.shape
+                points = np.column_stack((X_2d.ravel(), Y_2d.ravel(),
+                                          Z_2d.ravel()))
+                new_grid = pv.StructuredGrid()
+                new_grid.points = points.astype(np.float32)
+                new_grid.dimensions = (cols, rows, 1)
+                new_grid["elevation"] = Z_2d.flatten(order="F")
+
+                self.scene_objects["terrain"]["mesh"] = new_grid
+                extra["original_z"] = Z_2d
+                extra["X"] = X_2d
+                extra["Y"] = Y_2d
+                self._rebuild_actor("terrain")
+            else:
+                # Normal scene: just restore Z values on existing mesh
+                mesh = terrain_info["mesh"]
+                extra["original_z"] = Z_2d
+                pts = mesh.points
+                pts[:, 2] = Z_2d.flatten(order="F")
+                mesh.points = pts
+                mesh["elevation"] = Z_2d.flatten(order="F")
+                self._rebuild_actor("terrain")
+
+            # In DEM mode, skip sand/grass/earth layers (DEM scenes don't use them)
+            if not self._is_dem_scene():
+                self._rebuild_terrain_layers()
 
         # Restore transforms for ALL non-aircraft objects
         objects_data = terrain_data.get("objects", {})
@@ -1686,6 +1994,125 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
     # ═══════════════════════════════════════════════════════════════
+    #  DEM model import
+    # ═══════════════════════════════════════════════════════════════
+
+    def _import_dem_model(self):
+        """Import a DEM .img file and replace the scene with DEM terrain.
+
+        Replaces terrain/river/vegetation/bird/tree with the DEM surface.
+        Aircraft are repositioned at Z=1000m with 500x scale so they remain
+        visible in the large-coordinate scene.
+        """
+        if not HAS_RASTERIO:
+            import sys as _sys
+            QtWidgets.QMessageBox.warning(
+                self, "缺少依赖",
+                "导入 DEM 模型需要 rasterio 库。\n"
+                f"\n"
+                f"当前 Python: {_sys.executable}\n"
+                f"({_sys.version})\n"
+                f"\n"
+                f"请安装:\n"
+                f"  {_sys.executable} -m pip install rasterio"
+            )
+            return
+
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "导入 DEM 模型", "",
+            "DEM 文件 (*.img *.tif *.tiff);;HFA/IMG (*.img);;GeoTIFF (*.tif *.tiff);;所有文件 (*)"
+        )
+        if not path:
+            return
+
+        # ── Load DEM data ────────────────────────────────
+        try:
+            dem = load_dem(path, step=2)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "DEM 导入失败", f"无法读取 DEM 文件:\n{e}")
+            return
+
+        # ── Ask for vertical exaggeration ────────────────
+        vert_exag, ok = QtWidgets.QInputDialog.getDouble(
+            self, "DEM 垂直夸张",
+            "垂直夸张系数 (Z exaggeration):\n"
+            ">1 拉高山脉, <1 压低地形",
+            value=2.0, min=0.1, max=20.0, decimals=1,
+        )
+        if not ok:
+            return
+
+        reply = QtWidgets.QMessageBox.question(
+            self, "导入 DEM",
+            f"DEM 数据加载完成:\n"
+            f"  网格大小: {dem['rows']} × {dem['cols']} = {dem['rows']*dem['cols']:,} 点\n"
+            f"  X 范围: {dem['x'][0]:.0f} ~ {dem['x'][-1]:.0f} m\n"
+            f"  Y 范围: {dem['y'][0]:.0f} ~ {dem['y'][-1]:.0f} m\n"
+            f"  高程范围: {dem['z'].min():.0f} ~ {dem['z'].max():.0f} m\n"
+            f"  垂直夸张: {vert_exag:.1f}×\n"
+            f"  坐标基准: {dem.get('crs', 'N/A')}\n\n"
+            f"这将替换当前场景中的地形、河流、植被、鸟和树。\n"
+            f"飞机将被置于 Z=7000m 并放大 {AIRCRAFT_DEFAULT_SCALE:,}×。\n\n"
+            f"确认导入?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
+        )
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+
+        # ── Build DEM scene objects ──────────────────────
+        dem_scene = build_dem_scene(
+            dem,
+            vert_exag=vert_exag,
+            aircraft_scale=AIRCRAFT_DEFAULT_SCALE,
+            aircraft_z=7000.0,
+        )
+        self._dem_scene_active = True
+
+        terrain_extent = max(abs(dem['x'][0]), abs(dem['x'][-1]),
+                             abs(dem['y'][0]), abs(dem['y'][-1]))
+
+        # ── Completely reset scene ───────────────────────
+        self._flowing = False
+        self._clear_waypoints()
+        for name in list(self.plotter_actors.keys()):
+            self._remove_actor(name)
+        self.scene_objects.clear()
+        self._obj_transforms.clear()
+        self._terrain_chks.clear()
+        self._terrain_opacity_sliders.clear()
+        self._terrain_opacity_setters.clear()
+
+        # ── Add only DEM objects (terrain, aircraft, aircraft2) ──
+        for name, obj in dem_scene.items():
+            self.scene_objects[name] = obj
+            if obj["visible"]:
+                self._add_actor(name, obj)
+
+        # ── Update slider ranges for DEM-scale coords ────
+        slider_margin = terrain_extent * 1.2
+        self._update_slider_range(self._slider_obj_x, -slider_margin, slider_margin)
+        self._update_slider_range(self._slider_obj_y, -slider_margin, slider_margin)
+        self._update_slider_range(self._slider_obj_z, -500, 10000)
+
+        # ── Reset camera for the new scale ───────────────
+        cam_dist = terrain_extent * 2.5
+        self.plotter.camera_position = [
+            (cam_dist * 0.6, -cam_dist * 0.5, cam_dist * 0.4),
+            (0, 0, 500),
+            (0, 0, 1),
+        ]
+        self.plotter.camera.focal_point = (0, 0, 500)
+        self.plotter.render()
+
+        # ── Refresh UI ───────────────────────────────────
+        self._refresh_ui()
+        self.statusBar().showMessage(
+            f"DEM 已导入: {os.path.basename(path)}  "
+            f"({dem['rows']}×{dem['cols']}, "
+            f"Z {dem['z'].min():.0f}~{dem['z'].max():.0f}m)", 8000
+        )
+
+    # ═══════════════════════════════════════════════════════════════
     #  Path planning
     # ═══════════════════════════════════════════════════════════════
 
@@ -1718,6 +2145,39 @@ class MainWindow(QtWidgets.QMainWindow):
             3000,
         )
 
+    def _snap_to_terrain(self, world_pos):
+        """Return (x, y, terrain_z) by sampling the terrain mesh Z at (x, y)."""
+        terrain_info = self.scene_objects.get("terrain")
+        if terrain_info is None:
+            return world_pos
+        try:
+            mesh = terrain_info["mesh"]
+            closest = mesh.find_closest_point(tuple(world_pos))
+            if closest is not None:
+                return np.array([world_pos[0], world_pos[1], closest[2]], dtype=float)
+        except Exception:
+            pass
+        return world_pos
+
+    def _compute_terrain_extent(self):
+        """Return ``(xy_half, z_half)`` of the terrain mesh, or ``(10, 20)``."""
+        info = self.scene_objects.get("terrain")
+        if info is None:
+            return (10.0, 20.0)
+        try:
+            b = info["mesh"].bounds  # (xmin, xmax, ymin, ymax, zmin, zmax)
+            xy_half = max(abs(b[0]), abs(b[1]), abs(b[2]), abs(b[3]))
+            z_half = max(abs(b[4]), abs(b[5]))
+            if xy_half < 1.0:
+                return (10.0, 20.0)
+            return (xy_half, z_half)
+        except Exception:
+            return (10.0, 20.0)
+
+    def _is_dem_scene(self):
+        """Check if current scene is a DEM-imported scene (uses boolean flag)."""
+        return self._dem_scene_active
+
     def _open_precise_wp_dialog(self):
         if not _HAS_MPL:
             QtWidgets.QMessageBox.warning(
@@ -1725,7 +2185,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 "精准添加路径点需要 matplotlib 支持。\n请安装: pip install matplotlib"
             )
             return
-        dlg = WaypointPreciseDialog(self)
+        extent = self._compute_terrain_extent()
+        dlg = WaypointPreciseDialog(self, terrain_extent=extent)
         if dlg.exec_() == QtWidgets.QDialog.Accepted:
             coords_list = dlg.get_coords()
             for xyz in coords_list:
@@ -1969,6 +2430,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._flight_window = None
 
         self.plotter.render()
+
+        # Auto-select lead aircraft in object control panel
+        lead_idx = self._obj_combo.findText(name)
+        if lead_idx >= 0:
+            self._obj_combo.setCurrentIndex(lead_idx)
+
+        # Focus camera on lead aircraft in tail-chase view (if enabled)
+        if self._flight_camera_follow:
+            first_yaw = segments[0]["yaw"] if segments else 0.0
+            self._focus_camera_on_aircraft(np.array(aircraft_wps[0]), first_yaw)
+
         count = len(selected)
         label = f"编队 {count}机" if count > 1 else name
         self.statusBar().showMessage(
@@ -2117,6 +2589,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._obj_transforms[fname]["yaw"] = yaw
                 self._obj_transforms[fname]["pitch"] = pitch
                 self._apply_obj_transform_to_actor(fname)
+
+        # Tail-chase camera: always behind and above the lead aircraft (if enabled)
+        if self._flight_active and self._flight_camera_follow:
+            self._focus_camera_on_aircraft(pos, yaw)
 
     def _flight_tick(self):
         """Single animation step called by the flight timer."""
@@ -2643,10 +3119,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 class WaypointPreciseDialog(QtWidgets.QDialog):
-    def __init__(self, parent=None):
+    """Precise waypoint dialog with terrain-extent-aware XY/Z ranges."""
+
+    def __init__(self, parent=None, terrain_extent=None):
+        """*terrain_extent* = ``(xy_half, z_half)`` or ``None`` for defaults."""
         super().__init__(parent)
         self.setWindowTitle("精准添加路径点")
         self.setMinimumSize(640, 520)
+
+        if terrain_extent is not None:
+            xy_half, z_half = terrain_extent
+        else:
+            xy_half, z_half = 10.0, 20.0
+
+        self._xy_limit = xy_half * 1.2
+        self._z_limit = z_half * 1.5
+        self._spin_xy_range = xy_half * 2.0
 
         self._points = []
         self._z_values = []
@@ -2673,8 +3161,8 @@ class WaypointPreciseDialog(QtWidgets.QDialog):
 
         self._fig_xy = Figure(figsize=(5, 4))
         self._ax_xy = self._fig_xy.add_subplot(111)
-        self._ax_xy.set_xlim(-10, 10)
-        self._ax_xy.set_ylim(-10, 10)
+        self._ax_xy.set_xlim(-self._xy_limit, self._xy_limit)
+        self._ax_xy.set_ylim(-self._xy_limit, self._xy_limit)
         self._ax_xy.set_aspect("equal")
         self._ax_xy.grid(True, linestyle="--", alpha=0.7)
         self._ax_xy.set_xlabel("X")
@@ -2697,12 +3185,12 @@ class WaypointPreciseDialog(QtWidgets.QDialog):
 
         spin_layout = QtWidgets.QHBoxLayout()
         self._spin_x = QtWidgets.QDoubleSpinBox()
-        self._spin_x.setRange(-20, 20)
+        self._spin_x.setRange(-self._spin_xy_range, self._spin_xy_range)
         self._spin_x.setDecimals(2)
         self._spin_x.setPrefix("X: ")
         self._spin_x.valueChanged.connect(self._on_xy_spin_changed)
         self._spin_y = QtWidgets.QDoubleSpinBox()
-        self._spin_y.setRange(-20, 20)
+        self._spin_y.setRange(-self._spin_xy_range, self._spin_xy_range)
         self._spin_y.setDecimals(2)
         self._spin_y.setPrefix("Y: ")
         self._spin_y.valueChanged.connect(self._on_xy_spin_changed)
@@ -2738,7 +3226,7 @@ class WaypointPreciseDialog(QtWidgets.QDialog):
 
         self._fig_z = Figure(figsize=(5, 3))
         self._ax_z = self._fig_z.add_subplot(111)
-        self._ax_z.set_ylim(-20, 20)
+        self._ax_z.set_ylim(-self._z_limit, self._z_limit)
         self._ax_z.set_xlabel("路径距离")
         self._ax_z.set_ylabel("高度 Z")
         self._ax_z.grid(True, linestyle="--", alpha=0.7)
@@ -2754,7 +3242,7 @@ class WaypointPreciseDialog(QtWidgets.QDialog):
         layout.addLayout(info_layout)
 
         self._spin_z = QtWidgets.QDoubleSpinBox()
-        self._spin_z.setRange(-20, 20)
+        self._spin_z.setRange(-self._z_limit, self._z_limit)
         self._spin_z.setDecimals(2)
         self._spin_z.setPrefix("Z: ")
         self._spin_z.valueChanged.connect(self._on_z_spin_changed)
@@ -2786,8 +3274,8 @@ class WaypointPreciseDialog(QtWidgets.QDialog):
 
     def _redraw_xy(self):
         self._ax_xy.clear()
-        self._ax_xy.set_xlim(-10, 10)
-        self._ax_xy.set_ylim(-10, 10)
+        self._ax_xy.set_xlim(-self._xy_limit, self._xy_limit)
+        self._ax_xy.set_ylim(-self._xy_limit, self._xy_limit)
         self._ax_xy.set_aspect("equal")
         self._ax_xy.grid(True, linestyle="--", alpha=0.7)
         self._ax_xy.set_xlabel("X")
@@ -2929,7 +3417,7 @@ class WaypointPreciseDialog(QtWidgets.QDialog):
         self._ax_z.axhline(0, color="gray", linewidth=0.5)
         self._ax_z.set_xlabel("路径距离")
         self._ax_z.set_ylabel("高度 Z")
-        self._ax_z.set_ylim(-20, 20)
+        self._ax_z.set_ylim(-self._z_limit, self._z_limit)
         self._ax_z.grid(True, linestyle="--", alpha=0.7)
         self._ax_z.set_xticks(cum_dists)
         self._ax_z.set_xticklabels([f"{d:.2f}" for d in cum_dists], rotation=45)
@@ -2940,7 +3428,7 @@ class WaypointPreciseDialog(QtWidgets.QDialog):
         block = self._spin_z.blockSignals(True)
         self._spin_z.setValue(z_val)
         self._spin_z.blockSignals(block)
-        z_min, z_max = -20, 20
+        z_min, z_max = -self._z_limit, self._z_limit
         frac = (z_val - z_min) / (z_max - z_min)
         block_slider = self._z_slider.blockSignals(True)
         self._z_slider.setValue(int(frac * 1000))
@@ -2955,12 +3443,12 @@ class WaypointPreciseDialog(QtWidgets.QDialog):
         cum_dists = self._compute_cumulative_distances()
         idx = min(range(len(cum_dists)), key=lambda i: abs(cum_dists[i] - event.xdata))
         self._selected_z_idx = idx
-        z_val = round(max(-20.0, min(20.0, event.ydata)), 2)
+        z_val = round(max(-self._z_limit, min(self._z_limit, event.ydata)), 2)
         self._z_values[idx] = z_val
         block = self._spin_z.blockSignals(True)
         self._spin_z.setValue(z_val)
         self._spin_z.blockSignals(block)
-        z_min, z_max = -20, 20
+        z_min, z_max = -self._z_limit, self._z_limit
         frac = (z_val - z_min) / (z_max - z_min)
         block_sl = self._z_slider.blockSignals(True)
         self._z_slider.setValue(int(frac * 1000))
@@ -2971,7 +3459,7 @@ class WaypointPreciseDialog(QtWidgets.QDialog):
     def _on_z_slider_changed(self, value):
         if not self._z_values or self._selected_z_idx >= len(self._z_values):
             return
-        z_min, z_max = -20, 20
+        z_min, z_max = -self._z_limit, self._z_limit
         frac = value / 1000.0
         z_val = round(z_min + frac * (z_max - z_min), 2)
         self._z_values[self._selected_z_idx] = z_val
@@ -2986,7 +3474,7 @@ class WaypointPreciseDialog(QtWidgets.QDialog):
             return
         z_val = round(self._spin_z.value(), 2)
         self._z_values[self._selected_z_idx] = z_val
-        z_min, z_max = -20, 20
+        z_min, z_max = -self._z_limit, self._z_limit
         frac = (z_val - z_min) / (z_max - z_min)
         block = self._z_slider.blockSignals(True)
         self._z_slider.setValue(int(frac * 1000))

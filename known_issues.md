@@ -561,6 +561,218 @@ macOS双QVTK问题无法通过OffScreenRendering等方案彻底解决，FlightPl
 - 飞行期间编队按钮禁用，停止飞行后恢复
 - 状态栏显示"编队 N机"指示编队规模
 
+
+### [ID-28] PyVista `extract_surface(algorithm=None)` 崩溃 ✅
+
+- **状态**: 已验证修复
+- **模块**: DEM导入 / 场景构建
+- **严重程度**: 🔴 严重
+- **发现日期**: 2026-07-06
+- **修复日期**: 2026-07-06
+
+**问题描述**:
+运行 `3DSceneSoftware_test2.py` 时崩溃，错误为 `TypeError: extract_surface() got an unexpected keyword argument 'algorithm'`。
+同时 DEM 导入功能（导入模型 → DEM 模型）也因相同原因崩溃。
+
+**根因分析**:
+`scene_builder.py` 中 `build_terrain_layer_meshes()` 和 `dem_loader.py` 中 `build_dem_scene()` 均调用了
+`grid.extract_surface(algorithm=None)`。PyVista 的 `extract_surface()` 在旧版本（如 Python 3.9 环境下的版本）
+不接受 `algorithm` 关键字参数。虽然 0.48.x 版本支持该参数，但未来默认值会从 `'dataset_surface'` 改为 `None`，
+旧的 API 调用方式在新旧版本间不兼容。
+
+**修复内容**:
+- `scene_builder.py` line 305: `grid.extract_surface(algorithm=None)` → `grid.extract_surface()`
+- `dem_loader.py` line 229: 同上移除 `algorithm=None`
+
+**验证结果**:
+- ✅ 43/43 单元测试全部通过
+- ✅ DEM 加载正常：931×646 网格，Z 范围 -36~1128m
+- ✅ DEM 场景构建正常：terrain + 3 图层 + 2 架 aircraft
+- ✅ 飞机缩放 500×后尺寸：1125×1350×255，Z≈1048m
+- ✅ 原有默认场景功能不受影响（测试全部通过）
+
+
+### [ID-29] 多项功能新增与改进（鼠标坐标精度/菜单图层/Z夸张/7000m高度/全地形覆盖/XY自动范围）
+
+- **状态**: 已验证修复
+- **模块**: 全局（场景构建 / UI / 路径规划 / DEM导入）
+- **严重程度**: 🔴 严重
+- **发现日期**: 2026-07-06
+- **修复日期**: 2026-07-06
+
+**问题/需求描述**:
+
+1. **鼠标点击偏移**：3D视口中点击添加路径点时，路径点出现位置与鼠标点击位置不符。之前ID-3曾修复Y轴翻转问题，但`_to_vtk_display()`公式与QVTK内部`_setEventInformation`公式在Retina屏幕上仍有1像素偏差。
+2. **图层管理移至菜单**：需要将图层管理（沙地/草地/土地/河流/植被的复选框+透明度滑块）从右侧Dock面板移除，放到左上角菜单栏中，功能完全不变。
+3. **默认地形全覆盖**：默认地形（非DEM）的沙地/草地/土地图层仅覆盖底部70%高程范围，顶部30%无覆盖层。需要像DEM一样覆盖100%高程范围。
+4. **精准路径点XY自动范围**：`WaypointPreciseDialog`的XY散点图范围（±10）和Z剖面图范围（±20）为硬编码，在DEM大范围场景中不适用。需要根据terrain mesh的bounding box自动检测范围。
+5. **DEM导入Z夸张选项**：DEM导入时垂直夸张系数（vert_exag）为硬编码2.0，用户需要能在导入时选择该值。
+6. **飞机默认高度7000m**：DEM场景中飞机默认置于Z=1000m，对于大范围DEM地形（如ASTER GDEM 136km对角线）过低，需改为7000m。
+
+**修复内容**:
+
+1. **鼠标坐标精度修复** (`src/main_window.py`):
+   - `_to_vtk_display()`: 将Y坐标转换公式从`win_height - round(y*scale) - 1`改为`round((self.height() - y - 1) * scale)`，与QVTK的`_setEventInformation`完全一致，消除Retina屏幕上的1像素偏差。
+
+2. **图层管理移至菜单** (`src/main_window.py`):
+   - 新增`_build_layer_menu_action()`方法：为每个图层构建QWidgetAction（内嵌QCheckBox+透明度QSlider），保持与Dock面板完全相同的功能。
+   - 在`_setup_menus()`中添加"图层 (&L)"菜单，Alt+1~5快捷键。
+   - `_setup_docks()`中移除图层管理Dock面板（QDockWidget("图层管理")完全删除）。
+   - 所有回调方法（`_toggle_terrain_layer`、`_on_terrain_opacity`、`_refresh_terrain_ui`）保持不变。
+
+3. **默认地形全覆盖** (`src/scene_builder.py`):
+   - `build_terrain_layer_meshes()`: 将earth图层阈值上界从`z_min + elev_range * 0.70`改为`z_max + 1.0`，使沙地(0-20%)+草地(20-45%)+土地(45-100%)覆盖全部高程范围，与DEM行为一致。
+   - 删除不再使用的`earth_max`变量。
+
+4. **精准路径点XY自动范围** (`src/main_window.py`):
+   - `WaypointPreciseDialog.__init__()` 新增`terrain_extent`参数`(xy_half, z_half)`。
+   - 用实例变量`_xy_limit`、`_z_limit`、`_spin_xy_range`替代所有硬编码范围（±10、±20）。
+   - 所有Z相关方法（`_redraw_z`、`_on_z_click`、`_on_z_slider_changed`、`_on_z_spin_changed`）均使用动态范围。
+   - `MainWindow._compute_terrain_extent()`: 从terrain mesh的bounding box自动计算范围，带1.2×XY/1.5×Z边距。
+   - `_open_precise_wp_dialog()`: 调用`_compute_terrain_extent()`并传递给dialog。
+
+5. **DEM导入Z夸张选项** (`src/main_window.py`):
+   - `_import_dem_model()`: 加载DEM数据后，使用`QInputDialog.getDouble()`让用户选择垂直夸张系数（0.1~20.0，默认2.0）。
+   - 将用户选择的值传递给`build_dem_scene(vert_exag=...)`和确认对话框显示。
+   - 确认对话框现在显示"垂直夸张: X.X×"信息。
+
+6. **飞机默认高度7000m** (`src/dem_loader.py`, `src/main_window.py`):
+   - `build_dem_scene()`: 默认参数`aircraft_z`从`1000.0`改为`7000.0`。
+   - `_import_dem_model()`: 调用`build_dem_scene(aircraft_z=7000.0)`。
+   - 确认对话框提示文本从"Z=1000m"改为"Z=7000m"。
+   - DEM导入后的Z滑块范围从`-500~3000`改为`-500~10000`。
+   - `dem_loader.py` docstring更新。
+
+**验证结果**:
+- ✅ 43/43 单元测试全部通过
+- ✅ `_to_vtk_display`公式与QVTK完全一致
+- ✅ 图层管理在菜单中功能正常（复选框+透明度滑块）
+- ✅ 默认地形地球图层覆盖100%高程范围
+- ✅ WaypointPreciseDialog根据terrain mesh自动调整XY/Z范围
+- ✅ DEM导入时可选Z夸张系数
+- ✅ DEM场景飞机初始高度改为7000m
+
+---
+
+### [ID-30] DEM飞机放大（500×→2000×）
+
+- **状态**: 已验证修复
+- **模块**: DEM导入
+- **严重程度**: 🟡 一般
+- **发现日期**: 2026-07-06
+- **修复日期**: 2026-07-06
+
+**问题**: DEM场景中飞机默认缩放500×，在ASTER GDEM（~136km对角线）尺度下仍难以辨认。
+
+**修复**: `src/dem_loader.py` 中 `AIRCRAFT_DEFAULT_SCALE` 从 500 改为 2000，飞机长度约4.8km，在1296px视口下约44px，清晰可见。
+
+---
+
+### [ID-31] DEM对象控制优化（仅显示aircraft1/2/terrain，默认aircraft1）
+
+- **状态**: 已验证修复
+- **模块**: 对象控制/UI
+- **严重程度**: 🟡 一般
+- **发现日期**: 2026-07-06
+- **修复日期**: 2026-07-06
+
+**问题**: DEM场景中对象控制下拉框显示所有场景对象（包括不必要的river/vegetation/bird/tree），且顺序无优先级。
+
+**修复**: 
+- `_refresh_obj_combo()`: DEM模式下仅显示aircraft、aircraft2、terrain，按此顺序排列
+- `_refresh_scene_objects_ui()`: DEM模式场景对象复选框同理
+- 默认选中aircraft1
+- 新增 `_is_dem_scene()` 方法检测DEM场景（检查terrain extra中是否存在X/Y网格数据）
+
+---
+
+### [ID-32] DEM相机视图修复（俯视/侧视/复位使用地形动态范围）
+
+- **状态**: 已验证修复
+- **模块**: 视角
+- **严重程度**: 🔴 严重
+- **发现日期**: 2026-07-06
+- **修复日期**: 2026-07-06
+
+**问题**: `_set_view()` 硬编码 `dist=25`，在DEM大场景（~100km）中俯视/侧视完全不可用。`_reset_camera()` 同样使用小场景硬编码位置。
+
+**修复**: 
+- `_set_view()`: 使用 `_compute_terrain_extent()` 动态计算相机距离 `max(xy_half * 2.5, 25)`
+- `_reset_camera()`: 同样使用地形动态范围设置相机位置
+- `_reset_all()`: 继承 `_reset_camera` 动态行为
+
+---
+
+### [ID-33] DEM保存/载入修复（保存X,Y网格实现完整重构）
+
+- **状态**: 已验证修复
+- **模块**: 数据持久化
+- **严重程度**: 🔴 严重
+- **发现日期**: 2026-07-06
+- **修复日期**: 2026-07-06
+
+**问题**: DEM场景保存时仅保存 `original_z` 数组，不保存X/Y坐标网格。载入时无法完整恢复DEM地形。
+
+**修复**:
+- `_save_data()`: DEM场景额外保存 `X` 和 `Y` 二维数组到JSON
+- `_load_terrain_data()`: 检测保存数据中是否有X/Y，有则重建 `StructuredGrid`，无则保持原有逻辑
+
+---
+
+### [ID-34] 删除STL/OBJ导入，仅保留DEM导入
+
+- **状态**: 已验证修复
+- **模块**: 导入
+- **严重程度**: 🟡 一般
+- **发现日期**: 2026-07-06
+- **修复日期**: 2026-07-06
+
+**问题**: 「文件」菜单同时有「导入模型 (STL/OBJ)」和「导入 DEM 模型」两个选项，STL/OBJ导入功能在此项目中不再需要。
+
+**修复**: 从 `_setup_menus()` 中移除 `"导入模型 (STL/OBJ)..."` 菜单项，保留 `_import_model()` 方法（但不再通过菜单调用）。
+
+---
+
+### [ID-35] 3D交互鲁棒性改进（picker精度提升/None坐标处理）
+
+- **状态**: 已验证修复
+- **模块**: 3D交互
+- **严重程度**: 🔴 严重
+- **发现日期**: 2026-07-06
+- **修复日期**: 2026-07-06
+
+**问题**: `_on_3d_click` 中使用 `np.linalg.norm(world_pos) < 1e-6` 检查无效点击，但在DEM大场景中picker有时无法精确命中导致world_pos为(0,0,0)，路径点和测量交互被静默忽略。
+
+**修复**:
+- `_process_click()`: VTK CellPicker tolerance 从 0.001 提升到 0.005
+- 删除了最后保底的 `vtkWorldPointPicker`（返回焦平面深度，DEM中完全错误）
+- 改用 `None` 表示picker失败
+- `_on_3d_click()`: 改用 `world_pos is None` 检查替代向量范数检查
+
+---
+
+### [ID-36] 新增图层管理对话框（XY绘图工具+矩形/圆形/多边形选区）
+
+- **状态**: 已验证修复
+- **模块**: 图层管理/UI
+- **严重程度**: ⭐ 新功能
+- **发现日期**: 2026-07-06
+- **修复日期**: 2026-07-06
+
+**需求**: 需要一个统一的图层管理界面，支持在XY平面图上绘制选区（矩形/正方形/三角形/圆形/自定义多边形），将地形图层（沙地/草地/土地）仅添加到选区范围内。同时支持普通场景中的河流/植被快捷显隐。
+
+**实现**:
+- 新增 `src/layer_dialog.py`: `LayerManagementDialog` (QDialog)
+- 两页式QStackedWidget：
+  1. 第一页：图层选择（DEM: 沙地/草地/土地，普通: +河流/植被）
+  2. 第二页：XY平面图 + 绘图工具栏
+- 绘图工具：矩形、正方形(中心+半径)、三角形(3顶点)、圆形(中心+半径)、自定义多边形(多点击+闭合)
+- 左侧面板：形状列表（选中可调透明度、可删除）
+- 确认后调用 `_apply_layer_shapes()` 提取选区内的mesh子区域
+- 使用 matplotlib Path.contains_points 进行点-多边形包含测试
+
+---
+
 ## 当前已知问题
 
 <!-- 在此处按时间倒序添加问题条目 -->
@@ -569,6 +781,18 @@ macOS双QVTK问题无法通过OffScreenRendering等方案彻底解决，FlightPl
 |----|------|------|----------|------|
 
 ## 已关闭问题
+
+| ID | 标题 | 模块 | 修复日期 | 修复版本 |
+|----|------|------|----------|----------|
+| ID-36 | 新增图层管理对话框（XY绘图工具+矩形/圆形/多边形选区） | 图层管理/UI | 2026-07-06 | v2.2 |
+| ID-35 | 3D交互鲁棒性改进（picker精度提升/None坐标处理） | 3D交互 | 2026-07-06 | v2.2 |
+| ID-34 | 删除STL/OBJ导入，仅保留DEM导入 | 导入 | 2026-07-06 | v2.2 |
+| ID-33 | DEM保存/载入修复（保存X,Y网格实现完整重构） | 数据持久化 | 2026-07-06 | v2.2 |
+| ID-32 | DEM相机视图修复（俯视/侧视/复位使用地形动态范围） | 视角 | 2026-07-06 | v2.2 |
+| ID-31 | DEM对象控制优化（仅显示aircraft1/2/terrain，默认aircraft1） | 对象控制/UI | 2026-07-06 | v2.2 |
+| ID-30 | DEM飞机放大（AIRCRAFT_DEFAULT_SCALE 500→2000） | DEM导入 | 2026-07-06 | v2.2 |
+| ID-29 | 多项功能新增与改进（鼠标坐标精度/菜单图层/Z夸张/7000m高度/全地形覆盖/XY自动范围） | 全局 | 2026-07-06 | v2.1 |
+| ID-28 | PyVista `extract_surface(algorithm=None)` 崩溃 | DEM导入/场景构建 | 2026-07-06 | v2.0 |
 
 | ID | 标题 | 模块 | 修复日期 | 修复版本 |
 |----|------|------|----------|----------|
@@ -599,4 +823,5 @@ macOS双QVTK问题无法通过OffScreenRendering等方案彻底解决，FlightPl
 | ID-25 | FlightWindow 独立窗口 + 相机跟随完全删除 | 飞行动画/UI | 2026-07-03 | v1.8 |
 | ID-26 | 沙地/草地/土地图层默认不勾选 | 场景构建/图层管理 | 2026-07-03 | v1.8 |
 | ID-27 | 增加编队功能 | 飞行动画/UI | 2026-07-06 | v1.9 |
+| ID-28 | PyVista extract_surface(algorithm=None) 崩溃 | DEM导入/场景构建 | 2026-07-06 | v2.0 |
 

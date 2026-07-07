@@ -2,6 +2,9 @@
 *.png
 .omo/run-continuation/
 
+# Code intelligence index (auto-generated)
+.codegraph/
+
 # Python 缓存
 __pycache__/
 *.pyc

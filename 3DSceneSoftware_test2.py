@@ -17,6 +17,18 @@ _proj_root = os.path.dirname(os.path.abspath(__file__))
 if _proj_root not in sys.path:
     sys.path.insert(0, _proj_root)
 
+# ── Qt High-DPI attributes must be set BEFORE QCoreApplication is created ──
+from PyQt5.QtCore import Qt
+
+if hasattr(Qt, "AA_EnableHighDpiScaling"):
+    from PyQt5 import QtCore
+
+    QtCore.QCoreApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+if hasattr(Qt, "AA_UseHighDpiPixmaps"):
+    from PyQt5 import QtCore
+
+    QtCore.QCoreApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+
 import pyvista as pv
 from pyvista import themes
 from PyQt5 import QtWidgets
@@ -32,16 +44,9 @@ def main():
     app.setApplicationName("3DSceneSoftware")
     app.setOrganizationName("3DSceneSoft")
 
-    # Ensure high-DPI support
-    app.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
-    if hasattr(QtCore.Qt, "AA_EnableHighDpiScaling"):
-        app.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
-
     _ = MainWindow()
     sys.exit(app.exec_())
 
 
 if __name__ == "__main__":
-    # Late import for Qt attributes
-    from PyQt5 import QtCore
     main()

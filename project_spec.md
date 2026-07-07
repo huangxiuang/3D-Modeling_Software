@@ -162,6 +162,10 @@ SMALL change:
 - 截图功能：将当前 3D 视窗保存为 PNG/JPG。
 - 模型导出：支持将场景树中选中的模型导出为 STL 或 OBJ 格式。
 - 导入外部数据：支持加载通用 3D 格式 (.obj, .stl 等) 作为自定义对象加入场景树。
+  - **DEM 高程模型导入** (ID-28)：通过 `文件 → 导入 DEM 模型 (HFA/GeoTIFF)...` 加载 `.img` / `.tif` 格式的 ASTER GDEM / SRTM 高程数据。
+  - DEM 导入后自动替换场景中的地形 (terrain)、河流 (river)、植被 (vegetation)、鸟 (bird) 和树 (tree)。
+  - 飞机自动置于 Z=1000m 高度并放大 500× 以确保在 DEM 尺度下清晰可见。
+  - 技术实现：使用 `rasterio` 库读取 HFA/GeoTIFF → 滤波降采样 → 世界坐标系对齐 → 构建 `pyvista.StructuredGrid`。
 
 ### 6. 高级功能 (CAD 建模 + 分析)
 
@@ -196,3 +200,4 @@ SMALL change:
 | V1.0 | 2026-06-29 | 初始版本，完整功能基线 |
 | V1.6 | 2026-07-03 | 删除东北天坐标输入、隐藏高程标量条、图层初始100%透明、时间轴常驻主界面、FlightPlotter延迟渲染修复FlightWindow崩溃 |
 | V1.8 | 2026-07-03 | 独立飞行窗口完全删除(改为全主视口飞行)、沙地/草地/土地图层默认不勾选(勾选后显示全彩) |
+| V2.0 | 2026-07-06 | 修复 `extract_surface(algorithm=None)` PyVista 版本兼容崩溃 (ID-28)、Qt HiDPI 属性设置顺序修正、新增 DEM 高程模型导入文档 |

@@ -135,7 +135,10 @@ def test_default_scene_has_expected_objects():
     assert "aircraft2" in scene
     assert "bird" in scene
     assert "tree" in scene
-    assert len(scene) == 7
+    assert "layer_sand" in scene
+    assert "layer_grass" in scene
+    assert "layer_earth" in scene
+    assert len(scene) == 10
 
 
 def test_default_scene_objects_have_required_keys():
@@ -146,7 +149,11 @@ def test_default_scene_objects_have_required_keys():
         assert obj["type"] in ("mesh", "points"), f"{name} bad type"
         assert "visible" in obj, f"{name} missing 'visible'"
         assert "params" in obj, f"{name} missing 'params'"
-        assert obj["visible"] is True, f"{name} should start visible"
+        # ID-18/ID-26: layer overlays default to invisible; all else starts visible
+        if name.startswith("layer_"):
+            assert obj["visible"] is False, f"{name} should start hidden"
+        else:
+            assert obj["visible"] is True, f"{name} should start visible"
 
 
 def test_terrain_mesh_size():

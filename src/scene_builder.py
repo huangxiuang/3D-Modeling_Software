@@ -306,10 +306,9 @@ def build_terrain_layer_meshes(grid, Z):
     z_min, z_max = float(Z.min()), float(Z.max())
     elev_range = z_max - z_min
 
-    # Elevation thresholds for 3 bands — mountain tops (top ~25%) have NO overlay
+    # Elevation thresholds for 3 bands — full coverage (no gap) matching DEM
     sand_max = z_min + elev_range * 0.20
     grass_max = z_min + elev_range * 0.45
-    earth_max = z_min + elev_range * 0.70
 
     # Slight overlap to prevent visible gaps at band boundaries
     eps = 0.02
@@ -325,7 +324,7 @@ def build_terrain_layer_meshes(grid, Z):
         preference="point",
     )
     earth_mesh = surface.threshold(
-        [grass_max - eps, earth_max + eps],
+        [grass_max - eps, z_max + 1.0],
         scalars="elevation",
         preference="point",
     )
@@ -368,7 +367,7 @@ def build_terrain_layer_meshes(grid, Z):
             "params": {
                 "scalars": "elevation",
                 "cmap": ["#d4b896", "#8b6f47", "#5c4033"],
-                "clim": [grass_max, earth_max],
+                "clim": [grass_max, z_max],
                 "smooth_shading": True,
                 "opacity": 1.0,
                 "show_scalar_bar": False,
