@@ -773,6 +773,34 @@ macOS双QVTK问题无法通过OffScreenRendering等方案彻底解决，FlightPl
 
 ---
 
+### [ID-37] UI重构：场景树+属性面板+坐标简化+ASC导入导出+飞行/编队修复 ✅
+
+- **状态**: 已验证修复
+- **模块**: 全局
+- **严重程度**: 🔴 严重
+- **发现日期**: 2026-07-07
+- **修复日期**: 2026-07-07
+
+**修复内容**:
+- 删除坐标系切换(ENU/FLU/NED/NWU)，坐标统一用 X/Y/Z 纯数值显示
+- UI从splitter+scrollArea重构为：左dock(场景树) + 右dock(属性面板QStackedWidget) + 底dock(时间轴+坐标信息)
+- 属性面板按树选中项动态切换(飞机姿态/路径点/飞行动画)，不再包QScrollArea
+- 删除场景设置根节点(只剩飞行平台/路径规划/动画与任务三个根节点)
+- 删除"地图背景切换"按钮
+- "添加新飞机平台"→"添加新的飞机"，删除"+ 添加"里的"导入DEM模型数据"
+- 树中路径规划新增"精准添加路径"和"清除所有路径点"
+- 文件菜单新增"导入ASC格网数据..."和"导出ASC格网数据..."
+- ASC解析支持ESRI ASCII Grid格式(ncols/nrows/xllcorner/yllcorner/cellsize/NODATA_value)
+- 修复飞行按钮无响应(_btn_start_flight未接.clicked)
+- 修复编队僚机重叠(所有僚机之前共用同一个FORMATION_TRAIL_DIST)
+- 修复编队DEM场景距离(×AIRCRAFT_DEFAULT_SCALE×0.005)
+- 修复飞机顺位命名(最小空号)
+- 修复_add_new_aircraft崩溃(import不存在)
+- 修复DEM场景新建飞机不可见(scale/position适配)
+- 修复DEM场景对象控制combo不显示aircraft3+(硬编码列表)
+- 飞机命名规则：号1="aircraft", 号2+="aircraft2"...
+
+
 ## 当前已知问题
 
 <!-- 在此处按时间倒序添加问题条目 -->
@@ -820,4 +848,5 @@ macOS双QVTK问题无法通过OffScreenRendering等方案彻底解决，FlightPl
 | ID-34 | 删除STL/OBJ导入，仅保留DEM导入 | 导入 | 2026-07-06 | v2.2 |
 | ID-35 | 3D交互鲁棒性改进（picker精度提升/None坐标处理） | 3D交互 | 2026-07-06 | v2.2 |
 | ID-36 | 新增图层管理对话框（XY绘图工具+矩形/圆形/多边形选区） | 图层管理/UI | 2026-07-06 | v2.2 |
+| ID-37 | UI重构：场景树+属性面板+坐标简化+ASC导入导出+飞行/编队修复 | 全局 | 2026-07-07 | v2.4 |
 

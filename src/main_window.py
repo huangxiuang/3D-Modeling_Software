@@ -41,18 +41,19 @@ except ImportError:
 
 from src.config import (
     DEFAULT_CONFIG,
-    COORD_SYSTEMS,
-    world_to_coord_str,
     load_config,
     save_config,
 )
 from src.interaction import InteractionMode
+from src.scene_tree import SceneNodeType, NodeData, SceneTreeFactory
 from src.scene_builder import build_default_scene
 from src.measurement import MeasurementTool
 from src.collision import find_collisions
 from src.dem_loader import (
     load_dem,
     build_dem_scene,
+    dem_to_mesh,
+    _build_airplane_mesh,
     HAS_RASTERIO,
     AIRCRAFT_DEFAULT_SCALE,
 )
@@ -180,7 +181,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ── Config ──
         self.config = load_config()
-        self.coord_system = self.config.get("coordinate_system", "ENU")
 
         # Scene object registry:  name → dict (see scene_builder.py)
         self.scene_objects = {}
@@ -272,10 +272,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._init_scene()
 
         # ── UI SECOND (reads scene_objects) ──
+        self._prop_pages = {}
+        self._tree_items = {}
         self._setup_menus()
         self._setup_toolbar()
         self._setup_docks()
-        self._set_coord_system(self.coord_system)  # sync spinbox prefixes at startup
         self._refresh_ui()
 
         # ── Wire interaction callbacks on the plotter ──
@@ -442,6 +443,9 @@ class MainWindow(QtWidgets.QMainWindow):
         fm.addAction("连续截图 (录制) 开/关", self._toggle_recording)
         fm.addSeparator()
         fm.addAction("导入 DEM 模型 (HFA/GeoTIFF)...", self._import_dem_model)
+        fm.addAction("导入 ASC 格网数据...", self._import_asc_grid)
+        fm.addAction("导出 ASC 格网数据...", self._export_asc_grid)
+        fm.addSeparator()
         fm.addAction("导出选中模型...", self._export_selected)
         fm.addSeparator()
         fm.addAction("退出", self.close)
@@ -481,12 +485,6 @@ class MainWindow(QtWidgets.QMainWindow):
         tm.addSeparator()
         tm.addAction("碰撞检测...", self._run_collision_check)
         tm.addSeparator()
-        sm = tm.addMenu("坐标系")
-        for cs in COORD_SYSTEMS:
-            sm.addAction(
-                f"{cs} ({COORD_SYSTEMS[cs]['label']})",
-                lambda checked, c=cs: self._set_coord_system(c),
-            )
 
         # ── Layer management ──
         lm = mb.addMenu("图层 (&L)")
@@ -576,173 +574,76 @@ class MainWindow(QtWidgets.QMainWindow):
     # ── Docks ───────────────────────────────────────
 
     def _setup_docks(self):
-        # ── Left: 场景对象显隐 (layer mgmt moved to menu bar per ID-29) ──
-        dock_so = QtWidgets.QDockWidget("场景对象", self)
-        so_widget = QtWidgets.QWidget()
-        so_layout = QtWidgets.QVBoxLayout(so_widget)
-        so_layout.setContentsMargins(4, 4, 4, 4)
-        so_layout.setSpacing(3)
+        self._create_shared_widgets()
 
-        self._scene_obj_chks = {}       # name → QCheckBox
-        self._custom_obj_chks = {}      # name → QCheckBox
-        self._so_layout = so_layout     # for _refresh_scene_objects_ui
+        dock_sb = QtWidgets.QDockWidget("场景浏览器", self)
+        dock_sb.setFeatures(QtWidgets.QDockWidget.DockWidgetMovable)
 
-        so_layout.addStretch()
-        dock_so.setWidget(so_widget)
+        self._scene_browser = QtWidgets.QTreeWidget()
+        self._scene_browser.setHeaderHidden(True)
+        self._scene_browser.setAnimated(True)
+        self._scene_browser.setIndentation(15)
+        self._scene_browser.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._scene_browser.customContextMenuRequested.connect(self._on_tree_context_menu)
+        self._scene_browser.itemClicked.connect(self._on_tree_item_clicked)
+        self._scene_browser.itemDoubleClicked.connect(self._on_tree_item_double_clicked)
+        self._scene_browser.itemExpanded.connect(self._on_tree_item_expanded)
 
-        # Register right-side docks
-        self.addDockWidget(Qt.RightDockWidgetArea, dock_so)
+        tb_widget = QtWidgets.QWidget()
+        tb_layout = QtWidgets.QHBoxLayout(tb_widget)
+        tb_layout.setContentsMargins(4, 2, 4, 2)
+        self._btn_add = QtWidgets.QPushButton("+ 添加")
+        self._btn_delete = QtWidgets.QPushButton("- 删除")
+        self._btn_add.setFixedWidth(60)
+        self._btn_delete.setFixedWidth(60)
+        tb_layout.addWidget(self._btn_add)
+        tb_layout.addWidget(self._btn_delete)
+        tb_layout.addStretch()
 
-        # ── Left: 路径规划 ──
-        dock_path = QtWidgets.QDockWidget("路径规划", self)
-        pw = QtWidgets.QWidget()
-        pl = QtWidgets.QVBoxLayout(pw)
-        pl.setContentsMargins(4, 4, 4, 4)
+        container = QtWidgets.QWidget()
+        container_layout = QtWidgets.QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(0)
+        container_layout.addWidget(tb_widget)
+        container_layout.addWidget(self._scene_browser)
+        dock_sb.setWidget(container)
+        self.addDockWidget(Qt.LeftDockWidgetArea, dock_sb)
 
-        pl.addWidget(QtWidgets.QLabel("点击「添加路径点」后在场景中点击"))
-        self._btn_wp = QtWidgets.QPushButton("添加路径点 (3D 点击)")
-        self._btn_wp.setCheckable(True)
-        self._btn_wp.clicked.connect(self._on_wp_button)
-        pl.addWidget(self._btn_wp)
+        self._tree_items = SceneTreeFactory.build_tree(self._scene_browser)
 
-        self._btn_precise_wp = QtWidgets.QPushButton("精准添加路径点")
-        self._btn_precise_wp.clicked.connect(self._open_precise_wp_dialog)
-        pl.addWidget(self._btn_precise_wp)
+        self._btn_add.clicked.connect(self._on_tree_add)
+        self._btn_delete.clicked.connect(self._on_tree_delete)
 
-        pl.addWidget(QtWidgets.QLabel("— 路径操作 —"))
-        self._btn_clear_wp = QtWidgets.QPushButton("清除路径")
-        self._btn_clear_wp.clicked.connect(self._clear_waypoints)
-        pl.addWidget(self._btn_clear_wp)
+        self._property_dock = QtWidgets.QDockWidget("属性", self)
+        self._property_stack = QtWidgets.QStackedWidget()
+        self._property_dock.setWidget(self._property_stack)
+        self._property_dock.setMinimumWidth(180)
+        self.addDockWidget(Qt.RightDockWidgetArea, self._property_dock)
 
-        # Waypoint counter
-        self._wp_count_label = QtWidgets.QLabel("当前路径点: 0")
-        pl.addWidget(self._wp_count_label)
+        self._setup_property_pages()
+        self._property_stack.setCurrentIndex(0)
 
-        # ── Flight animation (ID-11) ──
-        pl.addWidget(QtWidgets.QLabel("— 飞行动画 —"))
-        flight_row = QtWidgets.QHBoxLayout()
-        flight_row.addWidget(QtWidgets.QLabel("选择飞机:"))
-        self._flight_aircraft_combo = QtWidgets.QComboBox()
-        flight_row.addWidget(self._flight_aircraft_combo)
-        pl.addLayout(flight_row)
-
-        self._btn_start_flight = QtWidgets.QPushButton("开始飞行")
-        self._btn_start_flight.clicked.connect(self._start_flight)
-        pl.addWidget(self._btn_start_flight)
-
-        self._chk_camera_follow = QtWidgets.QCheckBox("相机自动跟随")
-        self._chk_camera_follow.setChecked(False)
-        self._chk_camera_follow.toggled.connect(
-            lambda checked: setattr(self, '_flight_camera_follow', checked)
-        )
-        pl.addWidget(self._chk_camera_follow)
-
-        flight_save_row = QtWidgets.QHBoxLayout()
-        self._btn_save_flight = QtWidgets.QPushButton("保存飞行数据")
-        self._btn_save_flight.clicked.connect(self._save_flight_data)
-        flight_save_row.addWidget(self._btn_save_flight)
-        self._btn_load_flight = QtWidgets.QPushButton("载入飞行数据")
-        self._btn_load_flight.clicked.connect(self._load_flight_data)
-        flight_save_row.addWidget(self._btn_load_flight)
-        self._btn_formation = QtWidgets.QPushButton("编队飞行")
-        self._btn_formation.setCheckable(True)
-        self._btn_formation.setStyleSheet(
-            "QPushButton:checked { background-color: #4a90d9; color: white; font-weight: bold; }"
-        )
-        self._btn_formation.toggled.connect(self._on_formation_toggled)
-        flight_save_row.addWidget(self._btn_formation)
-        pl.addLayout(flight_save_row)
-
-        # Formation aircraft list (hidden by default)
-        self._formation_list = QtWidgets.QListWidget()
-        self._formation_list.setMaximumHeight(100)
-        self._formation_list.setVisible(False)
-        pl.addWidget(self._formation_list)
-
-        # ── Timeline container (ID-20, hidden until flight starts) ──
+        self._timeline_dock = QtWidgets.QDockWidget("飞行时间轴", self)
         self._timeline_container = QtWidgets.QWidget()
         tl = QtWidgets.QVBoxLayout(self._timeline_container)
         tl.setContentsMargins(0, 0, 0, 0)
-
         tl.addWidget(QtWidgets.QLabel("— 飞行时间轴 —"))
-
-        # Keyframe marker labels row
         self._keyframe_widget = QtWidgets.QWidget()
         self._kf_layout = QtWidgets.QHBoxLayout(self._keyframe_widget)
         self._kf_layout.setContentsMargins(0, 0, 0, 0)
         tl.addWidget(self._keyframe_widget)
-
-        # Time label
         self._tl_time_label = QtWidgets.QLabel("0.0 / 0.0 秒")
         tl.addWidget(self._tl_time_label)
-
-        # Slider
         self._tl_slider = QtWidgets.QSlider(Qt.Horizontal)
         self._tl_slider.setRange(0, 1000)
         self._tl_slider.sliderPressed.connect(self._on_tl_pressed)
         self._tl_slider.valueChanged.connect(self._on_tl_seek)
         self._tl_slider.sliderReleased.connect(self._on_tl_released)
         tl.addWidget(self._tl_slider)
-
-        pl.addWidget(self._timeline_container)
-
-        pl.addStretch()
-        dock_path.setWidget(pw)
-        self.addDockWidget(Qt.LeftDockWidgetArea, dock_path)
-
-        # ── Right: 对象控制 ──
-        dock_ctrl = QtWidgets.QDockWidget("对象控制", self)
-        cw = QtWidgets.QWidget()
-        cl = QtWidgets.QVBoxLayout(cw)
-        cl.setContentsMargins(4, 4, 4, 4)
-
-        cl.addWidget(QtWidgets.QLabel("选中对象:"))
-        self._obj_combo = QtWidgets.QComboBox()
-        self._obj_combo.currentIndexChanged.connect(self._on_obj_select_changed)
-        cl.addWidget(self._obj_combo)
-
-        cl.addWidget(QtWidgets.QLabel("位置 X"))
-        self._slider_obj_x = self._make_slider(-15, 15, 0, self._on_obj_pos_x)
-        cl.addWidget(self._slider_obj_x)
-
-        cl.addWidget(QtWidgets.QLabel("位置 Y"))
-        self._slider_obj_y = self._make_slider(-15, 15, 0, self._on_obj_pos_y)
-        cl.addWidget(self._slider_obj_y)
-
-        cl.addWidget(QtWidgets.QLabel("位置 Z"))
-        self._slider_obj_z = self._make_slider(-15, 15, 0, self._on_obj_pos_z)
-        cl.addWidget(self._slider_obj_z)
-
-        cl.addWidget(QtWidgets.QLabel("缩放"))
-        self._slider_obj_s = self._make_slider(0.1, 5.0, 1.0, self._on_obj_scale)
-        cl.addWidget(self._slider_obj_s)
-
-        # ── Aircraft attitude (hidden for non-aircraft, ID-5) ──
-        self._attitude_container = QtWidgets.QWidget()
-        ac = QtWidgets.QVBoxLayout(self._attitude_container)
-        ac.setContentsMargins(0, 0, 0, 0)
-        self._s_yaw_lbl = QtWidgets.QLabel("航向角 (Yaw)")
-        self._slider_obj_yaw = self._make_slider(0.0, 360.0, 0.0, self._on_obj_yaw)
-        ac.addWidget(self._s_yaw_lbl)
-        ac.addWidget(self._slider_obj_yaw)
-
-        self._s_pitch_lbl = QtWidgets.QLabel("俯仰角 (Pitch)")
-        self._slider_obj_pitch = self._make_slider(-90.0, 90.0, 0.0, self._on_obj_pitch)
-        ac.addWidget(self._s_pitch_lbl)
-        ac.addWidget(self._slider_obj_pitch)
-
-        self._s_roll_lbl = QtWidgets.QLabel("滚转角 (Roll)")
-        self._slider_obj_roll = self._make_slider(-180.0, 180.0, 0.0, self._on_obj_roll)
-        ac.addWidget(self._s_roll_lbl)
-        ac.addWidget(self._slider_obj_roll)
-        self._attitude_container.hide()
-        cl.addWidget(self._attitude_container)
-
-        cl.addStretch()
-        dock_ctrl.setWidget(cw)
-        self.addDockWidget(Qt.RightDockWidgetArea, dock_ctrl)
-
-
+        self._timeline_dock.setWidget(self._timeline_container)
+        self._timeline_dock.setVisible(False)
+        self.addDockWidget(Qt.BottomDockWidgetArea, self._timeline_dock)
+        self._timeline_dock.raise_()
 
         # ── Bottom: 坐标信息 ──
         dock_info = QtWidgets.QDockWidget("坐标信息", self)
@@ -752,6 +653,439 @@ class MainWindow(QtWidgets.QMainWindow):
         self._info_text.setFont(QtGui.QFont("Menlo", 10))
         dock_info.setWidget(self._info_text)
         self.addDockWidget(Qt.BottomDockWidgetArea, dock_info)
+
+    def _create_shared_widgets(self):
+        self._obj_combo = QtWidgets.QComboBox()
+        self._slider_obj_x = self._make_slider(-15, 15, 0, self._on_obj_pos_x)
+        self._slider_obj_y = self._make_slider(-15, 15, 0, self._on_obj_pos_y)
+        self._slider_obj_z = self._make_slider(-15, 15, 0, self._on_obj_pos_z)
+        self._slider_obj_s = self._make_slider(0.1, 5.0, 1.0, self._on_obj_scale)
+
+        self._attitude_container = QtWidgets.QWidget()
+        ac = QtWidgets.QVBoxLayout(self._attitude_container)
+        ac.setContentsMargins(0, 0, 0, 0)
+        self._s_yaw_lbl = QtWidgets.QLabel("航向角 (Yaw)")
+        self._slider_obj_yaw = self._make_slider(0.0, 360.0, 0.0, self._on_obj_yaw)
+        ac.addWidget(self._s_yaw_lbl)
+        ac.addWidget(self._slider_obj_yaw)
+        self._s_pitch_lbl = QtWidgets.QLabel("俯仰角 (Pitch)")
+        self._slider_obj_pitch = self._make_slider(-90.0, 90.0, 0.0, self._on_obj_pitch)
+        ac.addWidget(self._s_pitch_lbl)
+        ac.addWidget(self._slider_obj_pitch)
+        self._s_roll_lbl = QtWidgets.QLabel("滚转角 (Roll)")
+        self._slider_obj_roll = self._make_slider(-180.0, 180.0, 0.0, self._on_obj_roll)
+        ac.addWidget(self._s_roll_lbl)
+        ac.addWidget(self._slider_obj_roll)
+        self._attitude_container.hide()
+
+        self._scene_obj_chks = {}
+        self._custom_obj_chks = {}
+
+        self._so_layout_host = QtWidgets.QWidget()
+        self._so_layout_host.setVisible(False)
+        self._so_layout = QtWidgets.QVBoxLayout(self._so_layout_host)
+        self._so_layout.setContentsMargins(4, 4, 4, 4)
+        self._so_layout.setSpacing(3)
+        self._so_layout.addStretch()
+
+    def _setup_property_pages(self):
+        blank = QtWidgets.QWidget()
+        self._property_stack.addWidget(blank)
+        self._prop_pages[""] = blank
+
+        pages = [
+            (SceneNodeType.SCENE_SETTINGS, self._build_settings_property_page),
+            (SceneNodeType.AIRCRAFT, self._build_aircraft_property_page),
+            (SceneNodeType.WAYPOINT, self._build_waypoint_property_page),
+            (SceneNodeType.ANIMATION_TASK, self._build_animation_property_page),
+        ]
+        for node_type, builder in pages:
+            page = builder()
+            self._property_stack.addWidget(page)
+            self._prop_pages[node_type] = page
+
+    def _build_settings_property_page(self):
+        page = QtWidgets.QWidget()
+        lo = QtWidgets.QVBoxLayout(page)
+        lo.setSpacing(6)
+        lo.addWidget(QtWidgets.QLabel("场景设置"))
+        btn_cam = QtWidgets.QPushButton("相机复位")
+        btn_cam.clicked.connect(self._reset_camera)
+        lo.addWidget(btn_cam)
+        lo.addStretch()
+        return page
+
+    def _build_aircraft_property_page(self):
+        page = QtWidgets.QWidget()
+        lo = QtWidgets.QVBoxLayout(page)
+        lo.setContentsMargins(4, 4, 4, 4)
+        lo.addWidget(QtWidgets.QLabel("选中对象:"))
+        lo.addWidget(self._obj_combo)
+        lo.addWidget(QtWidgets.QLabel("位置 X"))
+        lo.addWidget(self._slider_obj_x)
+        lo.addWidget(QtWidgets.QLabel("位置 Y"))
+        lo.addWidget(self._slider_obj_y)
+        lo.addWidget(QtWidgets.QLabel("位置 Z"))
+        lo.addWidget(self._slider_obj_z)
+        lo.addWidget(QtWidgets.QLabel("缩放"))
+        lo.addWidget(self._slider_obj_s)
+        lo.addWidget(self._attitude_container)
+        lo.addStretch()
+        return page
+
+    def _build_waypoint_property_page(self):
+        page = QtWidgets.QWidget()
+        lo = QtWidgets.QVBoxLayout(page)
+        lo.setSpacing(6)
+        lo.addWidget(QtWidgets.QLabel("路径点"))
+        self._wp_idx_label = QtWidgets.QLabel("序号: -")
+        lo.addWidget(self._wp_idx_label)
+        lo.addStretch()
+        return page
+
+    def _build_animation_property_page(self):
+        page = QtWidgets.QWidget()
+        lo = QtWidgets.QVBoxLayout(page)
+        lo.setSpacing(6)
+        lo.addWidget(QtWidgets.QLabel("飞行动画控制"))
+        flight_row = QtWidgets.QHBoxLayout()
+        flight_row.addWidget(QtWidgets.QLabel("选择飞机:"))
+        self._flight_aircraft_combo = QtWidgets.QComboBox()
+        flight_row.addWidget(self._flight_aircraft_combo)
+        lo.addLayout(flight_row)
+        self._btn_start_flight = QtWidgets.QPushButton("开始飞行")
+        self._btn_start_flight.clicked.connect(self._toggle_flight)
+        lo.addWidget(self._btn_start_flight)
+        self._chk_camera_follow = QtWidgets.QCheckBox("相机自动跟随")
+        self._chk_camera_follow.setChecked(False)
+        self._chk_camera_follow.toggled.connect(
+            lambda checked: setattr(self, '_flight_camera_follow', checked))
+        lo.addWidget(self._chk_camera_follow)
+        self._btn_save_flight = QtWidgets.QPushButton("保存飞行数据")
+        lo.addWidget(self._btn_save_flight)
+        self._btn_load_flight = QtWidgets.QPushButton("载入飞行数据")
+        lo.addWidget(self._btn_load_flight)
+        self._btn_formation = QtWidgets.QPushButton("编队飞行")
+        self._btn_formation.setCheckable(True)
+        self._btn_formation.setStyleSheet(
+            "QPushButton:checked { background-color: #4a90d9; color: white; font-weight: bold; }")
+        self._btn_formation.toggled.connect(self._on_formation_toggled)
+        lo.addWidget(self._btn_formation)
+        self._formation_list = QtWidgets.QListWidget()
+        self._formation_list.setMaximumHeight(100)
+        self._formation_list.setVisible(False)
+        lo.addWidget(self._formation_list)
+        lo.addStretch()
+        return page
+
+    def _on_tree_item_clicked(self, item, column):
+        data = item.data(0, Qt.UserRole)
+        if data is None:
+            return
+        page = self._prop_pages.get(data.node_type)
+        if page is not None:
+            self._property_stack.setCurrentWidget(page)
+            self._property_dock.setVisible(True)
+        else:
+            self._property_dock.setVisible(False)
+        self._timeline_dock.setVisible(data.node_type == SceneNodeType.ANIMATION_TASK)
+        if data.node_type == SceneNodeType.WAYPOINT and data.aircraft_name is not None and data.waypoint_index is not None:
+            self._load_waypoint_to_property_page(data.aircraft_name, data.waypoint_index)
+        if data.node_type == SceneNodeType.AIRCRAFT and data.scene_obj_name:
+            self._sync_obj_combo_selection(data.scene_obj_name)
+
+    def _on_tree_item_double_clicked(self, item, column):
+        data = item.data(0, Qt.UserRole)
+        if data is None:
+            return
+        if data.node_type == SceneNodeType.WAYPOINT:
+            self._on_waypoint_double_click(data)
+        elif data.node_type == SceneNodeType.AIRCRAFT:
+            self._on_aircraft_double_click(data)
+        elif data.slot_name:
+            self._route_slot_action(data)
+
+    def _on_waypoint_double_click(self, data):
+        ac_name = data.aircraft_name
+        wp_idx = data.waypoint_index
+        if ac_name is None or wp_idx is None:
+            return
+        self._load_waypoint_to_property_page(ac_name, wp_idx)
+        self._highlight_waypoint(wp_idx)
+
+    def _on_aircraft_double_click(self, data):
+        if not data.scene_obj_name:
+            return
+        try:
+            self._sync_obj_combo_selection(data.scene_obj_name)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            QtWidgets.QMessageBox.warning(self, "错误",
+                "选择飞机时出错: {}".format(e))
+            return
+        page = self._prop_pages.get(SceneNodeType.AIRCRAFT)
+        if page:
+            self._property_stack.setCurrentWidget(page)
+
+    def _route_slot_action(self, data):
+        slot = data.slot_name
+        if slot == "_on_wp_button":
+            self._set_interaction_mode(InteractionMode.WAYPOINT)
+        elif slot == "_on_formation_toggled":
+            self._on_formation_toggled(not self._formation_mode)
+            page = self._prop_pages.get(SceneNodeType.ANIMATION_TASK)
+            if page is not None:
+                self._property_stack.setCurrentWidget(page)
+                self._property_dock.setVisible(True)
+        elif slot == "meas_tool.clear_all":
+            self.meas_tool.clear_all()
+        elif slot == "meas_tool.undo_last":
+            self.meas_tool.undo_last()
+        else:
+            method = getattr(self, slot, None)
+            if method and callable(method):
+                method()
+
+    def _on_tree_item_expanded(self, item):
+        data = item.data(0, Qt.UserRole)
+        if data is None:
+            return
+        if data.node_type == SceneNodeType.AIRCRAFT and data.scene_obj_name:
+            self._lazy_load_waypoints(item, data.scene_obj_name)
+
+    def _on_tree_context_menu(self, pos):
+        item = self._scene_browser.itemAt(pos)
+        if item is None:
+            return
+        data = item.data(0, Qt.UserRole)
+        if data is None:
+            return
+        menu = QtWidgets.QMenu(self)
+        if data.is_deletable:
+            act_del = menu.addAction("删除" + data.label + "")
+            act_del.triggered.connect(lambda: self._on_tree_delete_item(item))
+        if data.is_editable:
+            act_rename = menu.addAction("重命名")
+            act_rename.triggered.connect(lambda: self._on_tree_rename_item(item))
+        menu.exec_(self._scene_browser.viewport().mapToGlobal(pos))
+
+    def _on_tree_delete_item(self, item):
+        data = item.data(0, Qt.UserRole)
+        if data is None:
+            return
+        if data.node_type == SceneNodeType.AIRCRAFT and data.scene_obj_name:
+            self._delete_aircraft(data.scene_obj_name)
+            parent = item.parent()
+            if parent:
+                parent.removeChild(item)
+            self._refresh_ui()
+
+    def _on_tree_rename_item(self, item):
+        idx = self._scene_browser.indexOfTopLevelItem(item)
+        if idx >= 0:
+            return
+        self._scene_browser.editItem(item, 0)
+
+    def _on_tree_add(self):
+        menu = QtWidgets.QMenu(self)
+        act_ac = menu.addAction("添加新的飞机")
+        act_ac.triggered.connect(self._add_new_aircraft)
+        act_wp = menu.addAction("添加新的路径点")
+        act_wp.triggered.connect(self._open_precise_wp_dialog)
+        menu.exec_(self._btn_add.mapToGlobal(QtCore.QPoint(0, self._btn_add.height())))
+
+    def _on_tree_delete(self):
+        item = self._scene_browser.currentItem()
+        if item is None:
+            return
+        data = item.data(0, Qt.UserRole)
+        if data is None:
+            return
+        if not data.is_deletable:
+            QtWidgets.QMessageBox.information(self, "提示", "节点不可删除")
+            return
+        reply = QtWidgets.QMessageBox.question(self, "确认删除",
+            "确定要删除此节点吗?")
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+        self._on_tree_delete_item(item)
+
+    def _add_new_aircraft(self):
+        used = set()
+        for name in self.scene_objects:
+            low = name.lower()
+            if "aircraft" not in low:
+                continue
+            if name == "aircraft":
+                used.add(1)
+                continue
+            suffix = name[len("aircraft"):]
+            if suffix.isdigit():
+                used.add(int(suffix))
+        idx = 1
+        while idx in used:
+            idx += 1
+        new_name = "aircraft" if idx == 1 else "aircraft{}".format(idx)
+
+        mesh = _build_airplane_mesh().copy()
+        if self._dem_scene_active:
+            mesh.scale(AIRCRAFT_DEFAULT_SCALE, inplace=True)
+            offset = (idx - 1) * AIRCRAFT_DEFAULT_SCALE * 0.005
+            mesh.translate((offset, offset * 0.5, 7000.0), inplace=True)
+        else:
+            mesh.scale(1.5, inplace=True)
+            offset = (idx - 1) * 3.0
+            mesh.translate((-6 + offset, -2 + offset * 0.5, 8), inplace=True)
+
+        color = "orange" if idx > 2 else ("grey" if idx == 1 else "red")
+        self.scene_objects[new_name] = {
+            "mesh": mesh, "type": "mesh", "visible": True,
+            "params": {
+                "color": color, "smooth_shading": True,
+                "ambient": 0.3, "diffuse": 0.7,
+                "specular": 0.2, "specular_power": 30,
+            },
+            "extra": None, "name": new_name,
+        }
+        self._get_or_init_transform(new_name)
+        self._add_actor(new_name, self.scene_objects[new_name])
+        self._insert_aircraft_node(new_name)
+        self._refresh_ui()
+        self.statusBar().showMessage("已添加新飞机: {}".format(new_name), 3000)
+
+    def _insert_aircraft_node(self, name):
+        flight_root = self._tree_items.get(SceneNodeType.FLIGHT_PLATFORM)
+        if flight_root is None:
+            return
+        SceneTreeFactory._create_item(
+            flight_root,
+            NodeData(
+                node_type=SceneNodeType.AIRCRAFT,
+                label=name,
+                scene_obj_name=name,
+                tooltip="飞机: {}".format(name),
+                is_editable=True,
+                is_deletable=True,
+            ),
+        )
+
+    def _delete_aircraft(self, name):
+        if name is None:
+            return
+        self._remove_actor(name)
+        self.scene_objects.pop(name, None)
+        self._obj_transforms.pop(name, None)
+        self._aircraft_waypoints.pop(name, None)
+
+    def _delete_waypoint(self, ac_name, wp_idx):
+        if wp_idx is None:
+            return
+        waypoints = self._aircraft_waypoints.get(ac_name) or self.waypoints
+        if 0 <= wp_idx < len(waypoints):
+            waypoints.pop(wp_idx)
+        self._rebuild_waypoint_actors()
+
+    def _rebuild_waypoint_actors(self):
+        for a in self._wp_actors:
+            try:
+                self.plotter.remove_actor(a)
+            except Exception:
+                pass
+        self._wp_actors.clear()
+        if self._path_actor is not None:
+            try:
+                self.plotter.remove_actor(self._path_actor)
+            except Exception:
+                pass
+            self._path_actor = None
+        waypoints = self.waypoints
+        for i, wp in enumerate(waypoints):
+            sphere = pv.Sphere(radius=0.15, center=wp)
+            actor = self.plotter.add_mesh(sphere, color="red", smooth_shading=True)
+            self._wp_actors.append(actor)
+            label_actor = self.plotter.add_point_labels(
+                np.array([wp]), [str(i + 1)],
+                show_points=False, font_size=14, text_color="red",
+                shape_opacity=0.0, always_visible=True,
+            )
+            self._wp_actors.append(label_actor)
+        self.plotter.render()
+
+    def _populate_aircraft_nodes(self):
+        flight_root = self._tree_items.get(SceneNodeType.FLIGHT_PLATFORM)
+        if flight_root is None:
+            return
+        while flight_root.childCount() > 0:
+            flight_root.removeChild(flight_root.child(0))
+        for obj_name in self.scene_objects:
+            if "aircraft" not in obj_name.lower():
+                continue
+            self._insert_aircraft_node(obj_name)
+        flight_root.setExpanded(True)
+
+    def _lazy_load_waypoints(self, aircraft_item, aircraft_name):
+        if aircraft_item.childCount() > 0:
+            return
+        waypoints = self._aircraft_waypoints.get(aircraft_name) or self.waypoints
+        for i in range(len(waypoints)):
+            wp = waypoints[i]
+            time_label = "t={:.1f}s".format(i * 5.0)
+            SceneTreeFactory._create_item(
+                aircraft_item,
+                NodeData(
+                    node_type=SceneNodeType.WAYPOINT,
+                    label="路径点 {}".format(i + 1),
+                    scene_obj_name=None,
+                    waypoint_index=i,
+                    aircraft_name=aircraft_name,
+                    tooltip="{}  {}  ({:.1f}, {:.1f}, {:.1f})".format(
+                        time_label, i + 1, wp[0], wp[1], wp[2]),
+                    is_editable=True,
+                    is_deletable=True,
+                ),
+            )
+
+    def _load_waypoint_to_property_page(self, ac_name, wp_idx):
+        waypoints = self._aircraft_waypoints.get(ac_name) or self.waypoints
+        if wp_idx < 0 or wp_idx >= len(waypoints):
+            return
+        wp = waypoints[wp_idx]
+        page = self._prop_pages.get(SceneNodeType.WAYPOINT)
+        if page is None:
+            return
+        self._property_stack.setCurrentWidget(page)
+        self._property_dock.setVisible(True)
+        if hasattr(self, '_wp_idx_label'):
+            self._wp_idx_label.setText("序号: {}  ({:.1f}, {:.1f}, {:.1f})".format(
+                wp_idx + 1, wp[0], wp[1], wp[2]))
+        self._highlight_waypoint(wp_idx)
+
+    def _highlight_waypoint(self, wp_idx):
+        actor_idx = wp_idx * 2
+        if actor_idx < len(self._wp_actors):
+            sphere_actor = self._wp_actors[actor_idx]
+            try:
+                prop = sphere_actor.GetProperty()
+                prop.SetColor(1.0, 0.84, 0.0)
+                prop.SetEdgeColor(1.0, 0.0, 0.0)
+                prop.SetLineWidth(3)
+            except Exception:
+                pass
+
+    def _sync_obj_combo_selection(self, name):
+        idx = self._obj_combo.findText(name)
+        if idx >= 0:
+            self._obj_combo.blockSignals(True)
+            self._obj_combo.setCurrentIndex(idx)
+            self._obj_combo.blockSignals(False)
+            self._on_obj_select_changed(idx)
+
+    def _toggle_flight(self):
+        if self._flight_active:
+            self._stop_flight()
+        else:
+            self._start_flight()
 
     # ── Slider factory ─────────────────────────────
 
@@ -1201,11 +1535,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.scene_objects[clip_name]["visible"] = True
 
     def _refresh_ui(self):
-        """Refresh flight combo, terrain UI, and scene-object checkboxes."""
+        """Refresh flight combo, terrain UI, scene-object and tree."""
         self._refresh_obj_combo()
         self._refresh_flight_combo()
         self._refresh_terrain_ui()
         self._refresh_scene_objects_ui()
+        self._populate_aircraft_nodes()
 
     def _refresh_obj_combo(self):
         """Rebuild the object-control combo box.
@@ -1221,10 +1556,10 @@ class MainWindow(QtWidgets.QMainWindow):
         is_dem = self._is_dem_scene()
 
         if is_dem:
-            # DEM mode: ordered list with only aircraft, aircraft2, terrain
-            priority = ["aircraft", "aircraft2", "terrain"]
-            for name in priority:
-                if name in self.scene_objects:
+            # DEM mode: terrain first, then all aircraft objects
+            self._obj_combo.addItem("terrain")
+            for name in self.scene_objects:
+                if "aircraft" in name.lower():
                     self._obj_combo.addItem(name)
         else:
             for name in self.scene_objects:
@@ -1508,9 +1843,6 @@ class MainWindow(QtWidgets.QMainWindow):
         for btn, btn_mode in self._mode_buttons:
             btn.setChecked(btn_mode == mode and mode != InteractionMode.NORMAL)
 
-        # Sync waypoint button
-        self._btn_wp.setChecked(mode == InteractionMode.WAYPOINT)
-
         # Measurement mode internal
         if mode in (InteractionMode.MEASURE_DISTANCE, InteractionMode.MEASURE_ANGLE):
             self.meas_tool.set_mode(
@@ -1602,15 +1934,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_obj_combo()
         self._reset_camera()
 
-    def _set_coord_system(self, cs):
-        self.coord_system = cs
-        self.config["coordinate_system"] = cs
-        self.statusBar().showMessage(
-            f"坐标系: {cs}  ", 3000
-        )
-        self._update_info()
-
-
     # ═══════════════════════════════════════════════════════════════
     #  File I/O
     # ═══════════════════════════════════════════════════════════════
@@ -1646,10 +1969,6 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "错误", f"加载失败: {e}")
             return
         self.config.update(data.get("config", {}))
-        # Sync coordinate system after loading (ID-3)
-        loaded_cs = self.config.get("coordinate_system", "ENU")
-        if loaded_cs != self.coord_system:
-            self._set_coord_system(loaded_cs)
         if "camera" in data:
             self.plotter.camera_position = tuple(data["camera"])
         self.waypoints = [np.array(wp) for wp in data.get("waypoints", [])]
@@ -1869,9 +2188,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Restore config
         self.config.update(terrain_data.get("config", {}))
-        loaded_cs = self.config.get("coordinate_system", "ENU")
-        if loaded_cs != self.coord_system:
-            self._set_coord_system(loaded_cs)
 
         # Restore camera
         if "camera" in terrain_data:
@@ -2113,6 +2429,205 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     # ═══════════════════════════════════════════════════════════════
+    #  ASC grid import/export
+    # ═══════════════════════════════════════════════════════════════
+
+    def _import_asc_grid(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "导入 ASC 格网数据", "",
+            "ASC 格网数据 (*.asc);;所有文件 (*)"
+        )
+        if not path:
+            return
+
+        try:
+            dem = self._parse_asc(path)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "导入失败", f"无法解析 ASC 文件:\n{e}")
+            return
+
+        grid = dem_to_mesh(dem, vert_exag=1.0)
+
+        # ── Clear scene ─────────────────────────────────
+        self._flowing = False
+        self._clear_waypoints()
+        for name in list(self.plotter_actors.keys()):
+            self._remove_actor(name)
+        self.scene_objects.clear()
+        self._obj_transforms.clear()
+        self._terrain_chks.clear()
+        self._terrain_opacity_sliders.clear()
+        self._terrain_opacity_setters.clear()
+
+        terrain_obj = {
+            "mesh": grid,
+            "type": "mesh",
+            "visible": True,
+            "params": {"color": "#f2e2a8", "smooth_shading": True, "opacity": 1.0},
+            "extra": None,
+            "name": "terrain",
+        }
+        self.scene_objects["terrain"] = terrain_obj
+        self._add_actor("terrain", terrain_obj)
+
+        ac = _build_airplane_mesh().copy()
+        ac.scale(1.5, inplace=True)
+        ac.translate((-6, -2, 8), inplace=True)
+        self.scene_objects["aircraft"] = {
+            "mesh": ac, "type": "mesh", "visible": True,
+            "params": {"color": "#c4c4c4", "smooth_shading": True,
+                       "ambient": 0.35, "diffuse": 0.75,
+                       "specular": 0.6, "specular_power": 40},
+            "extra": None, "name": "aircraft",
+        }
+        self._add_actor("aircraft", self.scene_objects["aircraft"])
+
+        ac2 = _build_airplane_mesh().copy()
+        ac2.scale(1.5, inplace=True)
+        ac2.translate((-6, 3, 7.5), inplace=True)
+        self.scene_objects["aircraft2"] = {
+            "mesh": ac2, "type": "mesh", "visible": True,
+            "params": {"color": "#cc3333", "smooth_shading": True,
+                       "ambient": 0.35, "diffuse": 0.75,
+                       "specular": 0.6, "specular_power": 40},
+            "extra": None, "name": "aircraft2",
+        }
+        self._add_actor("aircraft2", self.scene_objects["aircraft2"])
+
+        self.plotter.reset_camera()
+        self.plotter.render()
+        self._refresh_ui()
+        self.statusBar().showMessage(
+            f"ASC 格网已导入: {os.path.basename(path)}  "
+            f"({dem['rows']}×{dem['cols']}, "
+            f"Z {dem['z'].min():.0f}~{dem['z'].max():.0f})", 8000
+        )
+
+    def _parse_asc(self, path):
+        with open(path) as f:
+            lines = f.readlines()
+
+        # ── Parse 6-line header ─────────────────────────
+        header = {}
+        idx = 0
+        while idx < len(lines) and len(header) < 6:
+            parts = lines[idx].strip().split()
+            if len(parts) >= 2:
+                key = parts[0].lower()
+                try:
+                    header[key] = float(parts[1])
+                except ValueError:
+                    pass
+            idx += 1
+
+        ncols = int(header.get("ncols", 0))
+        nrows = int(header.get("nrows", 0))
+        xll = header.get("xllcorner", 0.0)
+        yll = header.get("yllcorner", 0.0)
+        cellsize = header.get("cellsize", 1.0)
+        nodata = header.get("nodata_value", None)
+
+        if ncols <= 0 or nrows <= 0:
+            raise ValueError("无效的 ASC 头信息: ncols/nrows 缺失或为零")
+
+        # ── Read grid data ──────────────────────────────
+        data_lines = lines[idx:]
+        values = []
+        for line in data_lines:
+            vals = line.strip().split()
+            for v in vals:
+                try:
+                    values.append(float(v))
+                except ValueError:
+                    pass
+
+        if len(values) != ncols * nrows:
+            raise ValueError(
+                f"数据点数量不匹配: 期望 {ncols*nrows}, 实际 {len(values)}"
+            )
+
+        z = np.array(values, dtype=np.float32).reshape(nrows, ncols)
+
+        # ── Replace NODATA with 0 ───────────────────────
+        if nodata is not None:
+            z[z == nodata] = 0.0
+
+        # ── Build XY grid (centred around origin) ───────
+        x_raw = xll + cellsize / 2 + np.arange(ncols, dtype=np.float32) * cellsize
+        y_raw = yll + cellsize / 2 + np.arange(nrows, dtype=np.float32) * cellsize
+        y_raw = y_raw[::-1]
+
+        x_centre = (x_raw[-1] + x_raw[0]) * 0.5
+        y_centre = (y_raw[-1] + y_raw[0]) * 0.5
+        x = x_raw - x_centre
+        y = y_raw - y_centre
+
+        xx, yy = np.meshgrid(x, y)
+
+        return {
+            "z": z,
+            "x": x,
+            "y": y,
+            "xx": xx,
+            "yy": yy,
+            "rows": nrows,
+            "cols": ncols,
+            "pixel_size": cellsize,
+            "crs": None,
+            "full_resolution": (nrows, ncols),
+            "source": path,
+        }
+
+    def _export_asc_grid(self):
+        terrain_obj = self.scene_objects.get("terrain")
+        if terrain_obj is None:
+            QtWidgets.QMessageBox.information(self, "提示", "当前场景没有 DEM 地形数据可导出")
+            return
+        extra = terrain_obj.get("extra")
+        if extra is None:
+            QtWidgets.QMessageBox.information(self, "提示", "场景中缺少地形栅格数据，无法导出 ASC")
+            return
+
+        original_z = extra.get("original_z")
+        X = extra.get("X")
+        Y = extra.get("Y")
+        if original_z is None or X is None or Y is None:
+            QtWidgets.QMessageBox.information(self, "提示", "地形数据不完整，无法导出 ASC")
+            return
+
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "导出 ASC 格网数据", "terrain.asc",
+            "ASC 格网数据 (*.asc);;所有文件 (*)"
+        )
+        if not path:
+            return
+
+        try:
+            nrows, ncols = original_z.shape
+            cellsize = abs(X[0, 1] - X[0, 0]) if ncols > 1 else 1.0
+            x_centers = X[0, :]
+            y_centers = Y[:, 0]
+            xll = x_centers[0] - cellsize / 2
+            yll = y_centers[-1] - cellsize / 2
+
+            with open(path, "w") as f:
+                f.write(f"ncols         {ncols}\n")
+                f.write(f"nrows         {nrows}\n")
+                f.write(f"xllcorner     {xll:.6f}\n")
+                f.write(f"yllcorner     {yll:.6f}\n")
+                f.write(f"cellsize      {cellsize:.6f}\n")
+                f.write("NODATA_value  -9999\n")
+                for r in range(nrows):
+                    row_vals = " ".join(
+                        f"{original_z[r, c]:.1f}" for c in range(ncols)
+                    )
+                    f.write(row_vals + "\n")
+
+            self.statusBar().showMessage(f"ASC 已导出: {path}", 3000)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "导出失败", f"导出 ASC 文件时出错:\n{e}")
+
+    # ═══════════════════════════════════════════════════════════════
     #  Path planning
     # ═══════════════════════════════════════════════════════════════
 
@@ -2139,7 +2654,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._wp_actors.append(label_actor)
 
         self.plotter.render()
-        self._wp_count_label.setText(f"当前路径点: {idx}")
         self.statusBar().showMessage(
             f"路径点 #{idx}:  {world_pos[0]:.2f}, {world_pos[1]:.2f}, {world_pos[2]:.2f}",
             3000,
@@ -2200,7 +2714,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._path_actor is not None:
             self.plotter.remove_actor(self._path_actor)
             self._path_actor = None
-        self._wp_count_label.setText("当前路径点: 0")
         self.plotter.render()
 
     # ═══════════════════════════════════════════════════════════════
@@ -2383,14 +2896,17 @@ class MainWindow(QtWidgets.QMainWindow):
         t["offset"] = list(aircraft_wps[0])
         self._apply_obj_transform_to_actor(name)
 
-        # Fixed tail-chase distance, close but not overlapping (ID-27)
+        # Staggered tail-chase: each follower trails further behind (ID-27)
+        base_trail = self.FORMATION_TRAIL_DIST
+        if self._dem_scene_active:
+            base_trail = AIRCRAFT_DEFAULT_SCALE * 0.005
         self._formation_offsets.clear()
         leader_start = np.array(aircraft_wps[0])
-        for fname in selected[1:]:
-            self._formation_offsets[fname] = self.FORMATION_TRAIL_DIST
-            # Place follower directly behind leader at initial heading
+        for j, fname in enumerate(selected[1:]):
+            offset_dist = base_trail * (j + 1)
+            self._formation_offsets[fname] = offset_dist
             ft = self._get_or_init_transform(fname)
-            ft["offset"] = (leader_start + np.array([-self.FORMATION_TRAIL_DIST, 0, 0])).tolist()
+            ft["offset"] = (leader_start + np.array([-offset_dist, 0, 0])).tolist()
             ft["yaw"] = 0.0
             self._apply_obj_transform_to_actor(fname)
 
@@ -2807,13 +3323,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_load_flight.setEnabled(False)
 
         # Restore formation followers from saved data (ID-27)
+        base_trail = self.FORMATION_TRAIL_DIST
+        if self._dem_scene_active:
+            base_trail = AIRCRAFT_DEFAULT_SCALE * 0.005
         formation = data.get("formation", [name])
         self._flight_aircraft_list = formation
         self._formation_offsets.clear()
-        for fname in formation[1:]:
-            self._formation_offsets[fname] = self.FORMATION_TRAIL_DIST
+        for j, fname in enumerate(formation[1:]):
+            offset_dist = base_trail * (j + 1)
+            self._formation_offsets[fname] = offset_dist
             ft = self._get_or_init_transform(fname)
-            ft["offset"] = (np.array(start_pos) + np.array([-self.FORMATION_TRAIL_DIST, 0, 0])).tolist()
+            ft["offset"] = (np.array(start_pos) + np.array([-offset_dist, 0, 0])).tolist()
             ft["yaw"] = 0.0
             self._apply_obj_transform_to_actor(fname)
 
@@ -3012,39 +3532,29 @@ class MainWindow(QtWidgets.QMainWindow):
     # ═══════════════════════════════════════════════════════════════
 
     def _update_info(self, mouse_world=None):
-        """Update the coordinate-information dock."""
-        cs = self.coord_system
-        lines = [
-            f"坐标系: {cs}  ({COORD_SYSTEMS[cs]['label']})",
-            "",
-        ]
-
-        # ── Mouse coordinates FIRST (per ID-4) ──
+        lines = [""]
         if mouse_world is not None:
             try:
+                x, y, z = mouse_world
                 lines.append("🖱 鼠标 (世界坐标)")
-                lines.append(f"  {world_to_coord_str(cs, *mouse_world)}")
+                lines.append(f"  X={x:.2f},  Y={y:.2f},  Z={z:.2f}")
             except Exception:
                 pass
-
-        # ── Camera info SECOND ──
         try:
             cam = self.plotter.camera
             pos = cam.GetPosition()
             fp = cam.GetFocalPoint()
             lines.append("")
             lines.append("📷 相机")
-            lines.append(f"  位置:   {world_to_coord_str(cs, *pos)}")
-            lines.append(f"  目标:   {world_to_coord_str(cs, *fp)}")
+            lines.append(f"  位置:   X={pos[0]:.2f},  Y={pos[1]:.2f},  Z={pos[2]:.2f}")
+            lines.append(f"  目标:   X={fp[0]:.2f},  Y={fp[1]:.2f},  Z={fp[2]:.2f}")
             dist = np.linalg.norm(np.array(pos) - np.array(fp))
             lines.append(f"  距离:   {dist:.2f}")
         except Exception:
             pass
-
         if self.selected_name is not None:
             lines.append("")
             lines.append(f"✅ 选中: {self.selected_name}")
-
         self._info_text.setText("\n".join(lines))
 
 
