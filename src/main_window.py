@@ -978,11 +978,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _route_slot_action(self, data):
         slot = data.slot_name
         if slot == "_on_formation_toggled":
-            self._on_formation_toggled(not self._formation_mode)
-            page = self._prop_pages.get(SceneNodeType.ANIMATION_TASK)
-            if page is not None:
-                self._property_stack.setCurrentWidget(page)
-                self._property_dock.setVisible(True)
+            self._start_formation_dialog()
         elif slot == "meas_tool.clear_all":
             self.meas_tool.clear_all()
         elif slot == "meas_tool.undo_last":
@@ -1325,17 +1321,23 @@ class MainWindow(QtWidgets.QMainWindow):
         selected = [n for n in names if checks[n].isChecked()]
         if not selected:
             return
-        self._execute_flight(selected, delay_spins if delay_chk.isChecked() else {})
+        delays = {}
+        if delay_chk.isChecked():
+            for n, sb in delay_spins.items():
+                v = sb.value()
+                if v > 0:
+                    delays[n] = float(v)
+        self._execute_flight(selected, delays)
 
     def _execute_flight(self, selected, delays=None):
         if delays is None:
             delays = {}
-        self._flight_aircraft_combo.setCurrentText(selected[0])
         self._start_flight(selected[0])
         for n in selected[1:]:
-            d = delays.get(n, 0)
-            if d > 0:
-                QtCore.QTimer.singleShot(int(d * 1000), lambda name=n: self._start_flight(name))
+            d = delays.get(n, 0.0)
+            if d > 0.1:
+                QtCore.QTimer.singleShot(int(d * 1000),
+                    lambda name=n: self._start_flight(name))
             else:
                 self._start_flight(n)
 
