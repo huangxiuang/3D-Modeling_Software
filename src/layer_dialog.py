@@ -319,8 +319,13 @@ class LayerManagementDialog(QtWidgets.QDialog):
     def _on_canvas_move(self, event):
         if event.inaxes != self._ax or not self._pend_pts:
             return
-        # Just redraw on move for preview (simple approach)
+        # Show preview line + coordinates
         self._redraw_canvas(preview=(event.xdata, event.ydata))
+        if event.xdata and event.ydata:
+            self._status_label.setText(
+                f"当前工具: {self._current_tool}  |  "
+                f"坐标: ({event.xdata:.2f}, {event.ydata:.2f})  |  "
+                f"已点: {len(self._pend_pts)} 点")
 
     def _on_canvas_release(self, event):
         pass  # Not needed for this implementation
@@ -481,10 +486,14 @@ class LayerManagementDialog(QtWidgets.QDialog):
                          color=SHAPE_COLORS[len(self._shapes) % len(SHAPE_COLORS)],
                          markersize=6, linewidth=1.5, zorder=3)
 
-        # Preview cursor position
+        # Preview cursor position + dashed line from last point
         if preview:
             px, py = preview
             self._ax.plot(px, py, "x", color="red", markersize=8, zorder=4)
+            if len(self._pend_pts) > 0:
+                last = self._pend_pts[-1]
+                self._ax.plot([last[0], px], [last[1], py], "--",
+                             color="red", alpha=0.5, linewidth=1, zorder=3)
 
         self._ax.set_xlim(-lim, lim)
         self._ax.set_ylim(-lim, lim)

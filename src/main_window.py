@@ -60,6 +60,7 @@ from src.scene_tree import SceneNodeType, NodeData, SceneTreeFactory
 from src.scene_builder import build_default_scene
 from src.measurement import MeasurementTool
 from src.collision import find_collisions
+from src.flight_math import compute_flight_speed, compute_flight_state, lerp_angle, catmull_rom_position
 from src.dem_loader import (
     load_dem,
     build_dem_scene,
@@ -926,8 +927,44 @@ class MainWindow(QtWidgets.QMainWindow):
         wp_idx = data.waypoint_index
         if ac_name is None or wp_idx is None:
             return
-        self._load_waypoint_to_property_page(ac_name, wp_idx)
-        self._highlight_waypoint(wp_idx)
+        # Show coordinate editing dialog
+        self._edit_waypoint_dialog(ac_name, wp_idx)
+
+    def _edit_waypoint_dialog(self, ac_name, wp_idx):
+        waypoints = self._aircraft_waypoints.get(ac_name) or self.waypoints
+        if wp_idx < 0 or wp_idx >= len(waypoints):
+            return
+        wp = waypoints[wp_idx]
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(f"编辑路径点 #{wp_idx + 1}")
+        dlg.resize(320, 200)
+        lo = QtWidgets.QVBoxLayout(dlg)
+        lo.addWidget(QtWidgets.QLabel(f"路径点 #{wp_idx + 1} 坐标"))
+        form = QtWidgets.QFormLayout()
+        sx = QtWidgets.QDoubleSpinBox()
+        sx.setRange(-1e9, 1e9); sx.setDecimals(2); sx.setValue(wp[0])
+        sy = QtWidgets.QDoubleSpinBox()
+        sy.setRange(-1e9, 1e9); sy.setDecimals(2); sy.setValue(wp[1])
+        sz = QtWidgets.QDoubleSpinBox()
+        sz.setRange(-1e9, 1e9); sz.setDecimals(2); sz.setValue(wp[2])
+        form.addRow("X:", sx)
+        form.addRow("Y:", sy)
+        form.addRow("Z:", sz)
+        lo.addLayout(form)
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        lo.addWidget(btns)
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        new_wp = np.array([sx.value(), sy.value(), sz.value()])
+        waypoints[wp_idx] = new_wp
+        if ac_name and ac_name in self._aircraft_waypoints:
+            self._aircraft_waypoints[ac_name][wp_idx] = new_wp
+        self._rebuild_waypoint_actors()
+        self._log_action(f"用户编辑了路径点 #{wp_idx+1}: ({new_wp[0]:.2f}, {new_wp[1]:.2f}, {new_wp[2]:.2f})")
+        self.statusBar().showMessage(f"路径点 #{wp_idx+1} 已更新", 3000)
 
     def _on_aircraft_double_click(self, data):
         if not data.scene_obj_name:
@@ -3045,26 +3082,20 @@ class MainWindow(QtWidgets.QMainWindow):
     _MAX_FLIGHT_STEPS = 300
 
     def _flight_speed(self, pitch_deg, yaw_rate_deg_s):
-        """Systematic speed model returning effective velocity.
+        return compute_flight_speed(pitch_deg, yaw_rate_deg_s, self.CRUISE_SPEED)
 
-        V = V₀ × k_pitch(pitch) × k_turn(yaw_rate)
-
-        k_pitch = max(0.30, 1.0 − 0.35 × sin(pitch_rad))
-          pitch =  0° → k_pitch = 1.00  (level)
-          pitch = +30° → k_pitch = 0.83  (climbing, −17 %)
-          pitch = +60° → k_pitch = 0.70  (steep climb, −30 %)
-          pitch = −30° → k_pitch = 1.17  (diving, +17 %)
-          pitch = −60° → k_pitch = 1.30  (steep dive, +30 %)
-
-        k_turn = max(0.30, 1.0 − 0.006 × |yaw_rate|)
-          yaw_rate =   0 °/s → k_turn = 1.00
-          yaw_rate =  50 °/s → k_turn = 0.70
-          yaw_rate = 100 °/s → k_turn = 0.30  (clamped)
-        """
-        pitch_rad = math.radians(pitch_deg)
-        k_pitch = max(0.30, 1.0 - 0.35 * math.sin(pitch_rad))
-        k_turn = max(0.30, 1.0 - 0.006 * abs(yaw_rate_deg_s))
-        return self.CRUISE_SPEED * k_pitch * k_turn
+    def _draw_flight_preview(self, aircraft_wps):
+        """Draw a semi-transparent preview line through all waypoints."""
+        if len(aircraft_wps) < 2:
+            return
+        pts = np.array(aircraft_wps)
+        poly = pv.PolyData()
+        poly.points = pts
+        cells = np.hstack([[len(pts)], list(range(len(pts)))])
+        poly.lines = cells
+        self._path_actor = self.plotter.add_mesh(
+            poly, color="cyan", line_width=2, opacity=0.6)
+        self.plotter.render()
 
     def _start_flight(self):
         """Animate the selected aircraft through all waypoints.
@@ -3096,6 +3127,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if len(aircraft_wps) < 2:
             self.statusBar().showMessage("路径点不足（至少需要 2 个点）", 3000)
             return
+
+        # ── Draw flight path preview ──
+        self._draw_flight_preview(aircraft_wps)
 
         # Build flight path: start at waypoint[0], end at waypoint[-1] (ID-20)
         path = [np.array(wp) for wp in aircraft_wps]
@@ -3874,7 +3908,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._flowing:
             return
         info = self.scene_objects.get("river")
-        if info is None:
+        if info is None or not info.get("visible", True):
+            return
             return
         extra = info.get("extra")
         if extra is None:
