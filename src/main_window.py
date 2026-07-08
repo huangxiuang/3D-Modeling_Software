@@ -234,19 +234,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._terrain_opacity_sliders = {}  # name → slider widget
         self._terrain_opacity_setters = {}  # name → setter function
 
-        # Flight animation (ID-11)
-        self._flight_timer = QTimer(self)
-        self._flight_timer.timeout.connect(self._flight_tick)
-        self._flight_active = False
-        self._flight_path = []
-        self._flight_segments = []
-        self._flight_segment_idx = 0
-        self._flight_step = 0
-        self._flight_steps_per_segment = 0
-        self._flight_aircraft = ""
-        self._flight_aircraft_list = []  # all aircraft in current flight (ID-27)
-        self._flight_data_cache = None  # saved for later export
-        self._flight_camera_follow = False  # camera auto-track aircraft on flight
+        # Flight animation — multi-aircraft support
+        self._flights = {}   # name → {timer, path, segments, seg_idx, step, formation, cache, ...}
+        self._flight_active = False  # property; check _flights
+        self._flight_data_cache = None
+        self._flight_camera_follow = False
 
         # Per-aircraft waypoints (ID-20)
         self._aircraft_waypoints = {}   # name → list of waypoints (shared path attribute)
@@ -361,10 +353,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_terrain_changed(self, source_path=""):
         """Event handler: broadcast terrain change to all dependent subsystems."""
         # 0. Stop any active flight (old paths invalid on new terrain)
-        if self._flight_active:
+        if self._flight_active or self._flights:
             self._stop_flight()
-        self._flight_segments = []
-        self._flight_path = []
 
         # 1. Clear stale waypoints (global + per-aircraft)
         self._clear_waypoints()
@@ -3369,357 +3359,150 @@ class MainWindow(QtWidgets.QMainWindow):
             poly, color="cyan", line_width=2, opacity=0.6)
         self.plotter.render()
 
-    def _start_flight(self):
-        """Animate the selected aircraft through all waypoints.
-
-        In formation mode, the leader (first checked aircraft) follows the path;
-        followers maintain their initial offset from the leader.
-        """
-        if self._flight_active:
-            self._stop_flight()
-            return
-
-        # Determine which aircraft to fly
-        if self._formation_mode:
-            selected = self._get_formation_selection()
-            if len(selected) < 1:
-                self.statusBar().showMessage("编队模式：请至少选择一架飞机", 3000)
-                return
-            name = selected[0]  # leader
-        else:
+    def _start_flight(self, name=None):
+        """Animate an aircraft through its waypoints. Multi-flight safe."""
+        if name is None:
             name = self._flight_aircraft_combo.currentText()
-            selected = [name] if name else []
-
-        if not name:
-            self.statusBar().showMessage("请先选择一架飞机", 3000)
+        if not name or "aircraft" not in name.lower():
             return
-
-        # Get waypoints for the leader (ID-20: per-aircraft waypoints)
         aircraft_wps = self._get_aircraft_waypoints(name)
         if len(aircraft_wps) < 2:
-            self.statusBar().showMessage("路径点不足（至少需要 2 个点）", 3000)
+            self.statusBar().showMessage(f"{name} 路径点不足（≥2个）", 3000)
             return
-
-        # ── Draw flight path preview ──
         self._draw_flight_preview(aircraft_wps)
 
-        # Build flight path: start at waypoint[0], end at waypoint[-1] (ID-20)
         path = [np.array(wp) for wp in aircraft_wps]
-
-        # Ensure leader transform exists
         t = self._get_or_init_transform(name)
-
-        # ── Build segments with speed-aware step count ──
-        segments = []
         interval_s = self.FLIGHT_INTERVAL_MS / 1000.0
 
-        # First pass: compute raw yaw/pitch for each segment
         raw = []
         for i in range(len(path) - 1):
-            p0 = path[i]
-            p1 = path[i + 1]
-            dx = p1[0] - p0[0]
-            dy = p1[1] - p0[1]
-            dz = p1[2] - p0[2]
-            horiz_dist = np.sqrt(dx * dx + dy * dy) + 1e-12
-            dist = np.linalg.norm(p1 - p0) + 1e-12
-
+            p0, p1 = path[i], path[i+1]
+            dx, dy, dz = p1[0]-p0[0], p1[1]-p0[1], p1[2]-p0[2]
+            horiz_dist = np.sqrt(dx*dx + dy*dy) + 1e-12
+            dist = np.linalg.norm(p1-p0) + 1e-12
             yaw = math.degrees(math.atan2(dy, dx)) % 360.0
-            pitch = math.degrees(math.atan2(-dz, horiz_dist))
-            pitch = max(-90.0, min(90.0, pitch))
-
+            pitch = max(-90.0, min(90.0, math.degrees(math.atan2(-dz, horiz_dist))))
             raw.append({"dist": dist, "yaw": yaw, "pitch": pitch, "from": p0.tolist(), "to": p1.tolist()})
 
-        # Second pass: compute yaw-rate-aware speed & steps per segment
+        segments = []
         for i, r in enumerate(raw):
-            # Yaw change from previous segment (for turn factor)
+            d_yaw = 0.0
             if i > 0:
-                prev_yaw = raw[i - 1]["yaw"]
-                d_yaw = (r["yaw"] - prev_yaw) % 360.0
-                if d_yaw > 180.0:
-                    d_yaw -= 360.0
-            else:
-                d_yaw = 0.0
-
-            # Pitch factor → approximate speed for yaw-rate estimate
+                d_yaw = (r["yaw"] - raw[i-1]["yaw"]) % 360.0
+                if d_yaw > 180.0: d_yaw -= 360.0
             pitch_rad = math.radians(r["pitch"])
-            k_pitch_est = max(0.30, 1.0 - 0.35 * math.sin(pitch_rad))
+            k_pitch_est = max(0.30, 1.0 - 0.35*math.sin(pitch_rad))
             approx_speed = self.CRUISE_SPEED * k_pitch_est
-            approx_time = r["dist"] / approx_speed if approx_speed > 0 else 999.0
-            yaw_rate = abs(d_yaw) / approx_time if approx_time > 0 else 0.0
-
-            # Final speed with turn factor
+            approx_time = r["dist"]/approx_speed if approx_speed > 0 else 999.0
+            yaw_rate = abs(d_yaw)/approx_time if approx_time > 0 else 0.0
             V = self._flight_speed(r["pitch"], yaw_rate)
-            segment_time = r["dist"] / V if V > 0 else 999.0
-            steps = max(self._MIN_FLIGHT_STEPS,
-                        min(self._MAX_FLIGHT_STEPS,
-                            int(round(segment_time / interval_s))))
+            seg_time = r["dist"]/V if V > 0 else 999.0
+            steps = max(self._MIN_FLIGHT_STEPS, min(self._MAX_FLIGHT_STEPS, int(round(seg_time/interval_s))))
+            segments.append({"from": r["from"], "to": r["to"], "yaw": r["yaw"], "pitch": r["pitch"], "roll": 0.0, "steps": steps})
 
-            segments.append({
-                "from": r["from"],
-                "to": r["to"],
-                "yaw": r["yaw"],
-                "pitch": r["pitch"],
-                "roll": 0.0,
-                "steps": steps,
-            })
-
-        # Pre-compute total time for timeline (ID-20)
-        total_steps = sum(seg["steps"] for seg in segments)
+        total_steps = sum(s["steps"] for s in segments)
         total_time_ms = total_steps * self.FLIGHT_INTERVAL_MS
 
-        # Teleport leader to waypoint[0]
         t["offset"] = list(aircraft_wps[0])
         self._apply_obj_transform_to_actor(name)
 
-        # Staggered tail-chase: each follower trails further behind (ID-27)
-        base_trail = self.FORMATION_TRAIL_DIST
-        if self._dem_scene_active:
-            base_trail = AIRCRAFT_DEFAULT_SCALE * 0.005
-        self._formation_offsets.clear()
-        leader_start = np.array(aircraft_wps[0])
-        for j, fname in enumerate(selected[1:]):
-            offset_dist = base_trail * (j + 1)
-            self._formation_offsets[fname] = offset_dist
-            ft = self._get_or_init_transform(fname)
-            ft["offset"] = (leader_start + np.array([-offset_dist, 0, 0])).tolist()
-            ft["yaw"] = 0.0
-            self._apply_obj_transform_to_actor(fname)
-
-        cache = {
-            "aircraft_name": name,
-            "formation": selected,
-            "start_position": list(aircraft_wps[0]),
-            "waypoints": [list(wp) for wp in aircraft_wps[1:]],  # exclude start (stored above)
-            "segments": segments,
-            "interval_ms": self.FLIGHT_INTERVAL_MS,
+        timer = QTimer(self)
+        ft = {
+            "name": name, "timer": timer, "path": path, "segments": segments,
+            "seg_idx": 0, "step": 0, "formation": [name],
+            "cache": {"aircraft_name": name, "waypoints": [list(w) for w in aircraft_wps[1:]],
+                       "segments": segments, "interval_ms": self.FLIGHT_INTERVAL_MS,
+                       "start_position": list(aircraft_wps[0]), "formation": [name]},
+            "total_steps": total_steps, "total_time_ms": total_time_ms,
         }
-
-        # Start animation
+        timer.timeout.connect(lambda n=name: self._flight_tick(n))
+        self._flights[name] = ft
+        if not self._flight_active:
+            self._set_flight_ui_active(True)
         self._flight_active = True
-        self._flight_aircraft = name
-        self._flight_aircraft_list = selected  # all aircraft in this flight (ID-27)
-        self._flight_path = path
-        self._flight_segments = segments
-        self._flight_segment_idx = 0
-        self._flight_step = 0
-        self._flight_data_cache = cache
-
-        # Timeline state (ID-20)
+        # Update timeline for first flight
         self._total_flight_steps = total_steps
         self._total_flight_time_ms = total_time_ms
-
         self._tl_slider.setRange(0, total_time_ms)
         self._tl_slider.setValue(0)
-        self._update_timeline_label(0)
         self._setup_keyframe_labels(len(aircraft_wps))
         self._btn_start_flight.setText("停止飞行")
-        self._flight_aircraft_combo.setEnabled(False)
-        self._btn_formation.setEnabled(False)
-        self._btn_save_flight.setEnabled(False)
-        self._btn_load_flight.setEnabled(False)
+        timer.start(self.FLIGHT_INTERVAL_MS)
+        self._log_action(f"开始飞行: {name} ({len(aircraft_wps)} 路径点, {total_time_ms/1000:.1f}s)")
+        self.statusBar().showMessage(f"飞行: {name} ({total_time_ms/1000:.1f}s)", 3000)
 
-        self._flight_window = None
+    def _set_flight_ui_active(self, active):
+        self._btn_start_flight.setText("停止飞行" if active else "开始飞行")
+        self._flight_aircraft_combo.setEnabled(not active)
+        self._btn_formation.setEnabled(not active)
+        self._btn_save_flight.setEnabled(not active)
+        self._btn_load_flight.setEnabled(not active)
 
-        self.plotter.render()
-
-        # Auto-select lead aircraft in object control panel
-        lead_idx = self._obj_combo.findText(name)
-        if lead_idx >= 0:
-            self._obj_combo.setCurrentIndex(lead_idx)
-
-        # Focus camera on lead aircraft in tail-chase view (if enabled)
-        if self._flight_camera_follow:
-            first_yaw = segments[0]["yaw"] if segments else 0.0
-            self._focus_camera_on_aircraft(np.array(aircraft_wps[0]), first_yaw)
-
-        count = len(selected)
-        label = f"编队 {count}机" if count > 1 else name
-        self._log_action(f"用户开始了飞行 ({label})")
-        self.statusBar().showMessage(
-            f"飞行开始: {label} → {len(aircraft_wps)} 个路径点 ({total_time_ms/1000:.1f}s)", 3000
-        )
-        self._flight_timer.start(self.FLIGHT_INTERVAL_MS)
-
-    def _stop_flight(self):
-        self._flight_timer.stop()
-        self._flight_active = False
-        self._flight_segment_idx = 0
-        self._flight_step = 0
-
-        self._btn_start_flight.setText("开始飞行")
-        self._flight_aircraft_combo.setEnabled(True)
-        self._btn_formation.setEnabled(True)
-        self._btn_save_flight.setEnabled(True)
-        self._btn_load_flight.setEnabled(True)
-        self._log_action("用户停止了飞行")
-
-    # ────────────────────────────────────────────────────────────────
-    #  ID-14: Smooth flight path & attitude
-    # ────────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _catmull_rom_position(path, seg_idx, t):
-        """Catmull-Rom spline interpolated position for segment seg_idx at t (0..1).
-
-        Produces smooth C1-continuous curves through all waypoints.
-        For boundary segments, phantom control points are mirrored to maintain tangency.
-        """
-        n = len(path)
-        p1 = path[seg_idx]
-        p2 = path[seg_idx + 1]
-
-        # Left neighbour (mirrored at boundary)
-        if seg_idx > 0:
-            p0 = path[seg_idx - 1]
+    def _stop_flight(self, name=None):
+        if name:
+            f = self._flights.pop(name, None)
+            if f: f["timer"].stop()
         else:
-            p0 = 2 * p1 - p2
+            for f in list(self._flights.values()):
+                f["timer"].stop()
+            self._flights.clear()
+        if not self._flights:
+            self._flight_active = False
+            self._set_flight_ui_active(False)
+            self._log_action("飞行停止")
 
-        # Right neighbour (mirrored at boundary)
-        if seg_idx + 2 < n:
-            p3 = path[seg_idx + 2]
-        else:
-            p3 = 2 * p2 - p1
-
-        t2 = t * t
-        t3 = t2 * t
-        return 0.5 * (
-            (2 * p1)
-            + (-p0 + p2) * t
-            + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2
-            + (-p0 + 3 * p1 - 3 * p2 + p3) * t3
-        )
-
-    @staticmethod
-    def _lerp_angle(a, b, t):
-        """Linearly interpolate between two angles (degrees), taking the shortest path across 0/360."""
-        d = (b - a) % 360.0
-        if d > 180.0:
-            d -= 360.0
-        return (a + d * t) % 360.0
-
-    def _compute_flight_state_at(self, seg_idx, step):
-        """Compute aircraft position and attitude at (segment, step).
-
-        Returns a dict with ``pos`` (np.array), ``yaw``, ``pitch``, ``roll``,
-        or ``None`` if the segment index is out of range.
-        """
-        segments = self._flight_segments
-        if seg_idx >= len(segments):
-            return None
-
-        seg = segments[seg_idx]
-        steps = seg["steps"]
-        t_val = step / float(steps) if steps > 0 else 1.0
-        t_val = min(t_val, 1.0)
-
-        pos = self._catmull_rom_position(self._flight_path, seg_idx, t_val)
-
-        entry_yaw = float(seg["yaw"])
-        if seg_idx + 1 < len(segments):
-            exit_yaw = float(segments[seg_idx + 1]["yaw"])
-        else:
-            exit_yaw = entry_yaw
-        yaw = self._lerp_angle(entry_yaw, exit_yaw, t_val)
-
-        entry_pitch = float(seg["pitch"])
-        if seg_idx + 1 < len(segments):
-            exit_pitch = float(segments[seg_idx + 1]["pitch"])
-        else:
-            exit_pitch = entry_pitch
-        pitch = entry_pitch + (exit_pitch - entry_pitch) * t_val
-        pitch = max(-90.0, min(90.0, pitch))
-
-        roll = 0.0
-
-        return {"pos": pos, "yaw": yaw, "pitch": pitch, "roll": roll}
-
-    def _apply_flight_state(self, state):
-        """Apply a flight state dict to the aircraft actor(s) + UI sliders.
-
-        In formation mode, also updates all followers relative to the leader.
-        """
-        if state is None:
+    def _flight_tick(self, name):
+        f = self._flights.get(name)
+        if f is None:
             return
-        name = self._flight_aircraft
-        pos = state["pos"]
-        yaw = state["yaw"]
-        pitch = state["pitch"]
-        roll = state["roll"]
+        try:
+            seg_idx, step = f["seg_idx"], f["step"]
+            segments, path = f["segments"], f["path"]
+            if seg_idx >= len(segments):
+                f["timer"].stop()
+                self._flights.pop(name, None)
+                if not self._flights:
+                    self._flight_active = False
+                    self._set_flight_ui_active(False)
+                self._log_action(f"{name} 飞行完成")
+                self.statusBar().showMessage(f"{name} 飞行完成", 3000)
+                return
+            seg = segments[seg_idx]
+            steps_in_seg = seg["steps"]
+            t_val = step / float(steps_in_seg) if steps_in_seg > 0 else 1.0
+            t_val = min(t_val, 1.0)
+            pos = self._catmull_rom_position(path, seg_idx, t_val)
+            entry_yaw = float(seg["yaw"])
+            exit_yaw = float(segments[seg_idx+1]["yaw"]) if seg_idx+1 < len(segments) else entry_yaw
+            yaw = self._lerp_angle(entry_yaw, exit_yaw, t_val)
+            entry_pitch = float(seg["pitch"])
+            exit_pitch = float(segments[seg_idx+1]["pitch"]) if seg_idx+1 < len(segments) else entry_pitch
+            pitch = max(-90.0, min(90.0, entry_pitch + (exit_pitch - entry_pitch) * t_val))
+            self._apply_flight_state_single(name, pos, yaw, pitch)
+            self._update_timeline()
+            f["step"] += 1
+            if f["step"] >= steps_in_seg:
+                f["seg_idx"] += 1
+                f["step"] = 0
+        except Exception as e:
+            self._stop_flight(name)
+            self.statusBar().showMessage(f"飞行错误({name}): {e}", 5000)
 
-        # Update leader transform
+    def _apply_flight_state_single(self, name, pos, yaw, pitch):
         if name in self._obj_transforms:
             self._obj_transforms[name]["offset"] = pos.tolist()
             self._obj_transforms[name]["yaw"] = yaw
             self._obj_transforms[name]["pitch"] = pitch
-            self._obj_transforms[name]["roll"] = roll
-
-        # Update UI sliders (block signals to avoid double-trigger)
-        self._set_slider_value(self._slider_obj_x, pos[0])
-        self._set_slider_value(self._slider_obj_y, pos[1])
-        self._set_slider_value(self._slider_obj_z, pos[2])
-        self._set_slider_value(self._slider_obj_yaw, yaw)
-        self._set_slider_value(self._slider_obj_pitch, pitch)
-        self._set_slider_value(self._slider_obj_roll, roll)
-
-        # Apply to VTK actor on main window
-        self._apply_obj_transform_to_actor(name)
-
-        # Update tail-chase followers: same altitude, fixed trail distance behind leader (ID-27)
-        aircraft_list = getattr(self, '_flight_aircraft_list', [])
-        if len(aircraft_list) > 1:
-            yaw_rad = math.radians(yaw)
-            hx, hy = math.cos(yaw_rad), math.sin(yaw_rad)  # leader heading
-            for fname in aircraft_list[1:]:
-                d = self._formation_offsets.get(fname)
-                if d is None or fname not in self._obj_transforms:
-                    continue
-                # Follower position: directly behind leader along its heading
-                fx = pos[0] - hx * d
-                fy = pos[1] - hy * d
-                fz = pos[2]  # same altitude
-                self._obj_transforms[fname]["offset"] = [fx, fy, fz]
-                self._obj_transforms[fname]["yaw"] = yaw
-                self._obj_transforms[fname]["pitch"] = pitch
-                self._apply_obj_transform_to_actor(fname)
-
-        # Tail-chase camera: always behind and above the lead aircraft (if enabled)
-        if self._flight_active and self._flight_camera_follow:
-            self._focus_camera_on_aircraft(pos, yaw)
-
-    def _flight_tick(self):
-        """Single animation step called by the flight timer."""
-        if not self._flight_active:
-            return
-
-        try:
-            seg_idx = self._flight_segment_idx
-            step = self._flight_step
-            segments = self._flight_segments
-            name = self._flight_aircraft
-
-            if seg_idx >= len(segments):
-                self._stop_flight()
-                self.statusBar().showMessage("飞行完成", 5000)
-                return
-
-            seg = segments[seg_idx]
-            steps_in_seg = seg["steps"]
-
-            state = self._compute_flight_state_at(seg_idx, step)
-            self._apply_flight_state(state)
-
-            # Update timeline (ID-20)
-            self._update_timeline()
-
-            # Advance step / segment
-            self._flight_step += 1
-            if self._flight_step >= steps_in_seg:
-                self._flight_segment_idx += 1
-                self._flight_step = 0
-        except Exception as e:
-            self._stop_flight()
-            self.statusBar().showMessage(f"飞行错误: {e}", 5000)
+            self._apply_obj_transform_to_actor(name)
+        # Update slider if this is the selected object
+        cur = self._obj_combo.currentText().replace("[自定义] ", "")
+        if cur == name:
+            self._set_slider_value(self._slider_obj_x, pos[0])
+            self._set_slider_value(self._slider_obj_y, pos[1])
+            self._set_slider_value(self._slider_obj_z, pos[2])
+            self._set_slider_value(self._slider_obj_yaw, yaw)
+            self._set_slider_value(self._slider_obj_pitch, pitch)
 
     # ═══════════════════════════════════════════════════════════════
     #  Flight data persistence (ID-11)
@@ -3733,11 +3516,12 @@ class MainWindow(QtWidgets.QMainWindow):
         return d
 
     def _save_flight_data(self):
-        """Save the last flight data to a JSON file."""
-        cache = self._flight_data_cache
-        if cache is None:
+        if not self._flights:
             self.statusBar().showMessage("没有可保存的飞行数据，请先执行一次飞行", 3000)
             return
+        # Use the first flight's cache
+        first = next(iter(self._flights.values()))
+        cache = first["cache"]
 
         name, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, "保存飞行数据",
@@ -3876,50 +3660,30 @@ class MainWindow(QtWidgets.QMainWindow):
         # Old saved files have waypoints including start_position — deduplicate.
         saved_wps = data.get("waypoints", [])
         if start_pos is not None and saved_wps and saved_wps[0] == list(start_pos):
-            saved_wps = saved_wps[1:]  # old format: strip duplicate start
-        self._flight_path = [np.array(p) for p in [start_pos] + saved_wps]
-        self._flight_active = True
-        self._flight_aircraft = name
-        self._flight_segments = segments
-        self._flight_segment_idx = 0
-        self._flight_step = 0
-        self._flight_steps_per_segment = segments[0].get("steps", 50)
-        self._flight_data_cache = data
+            saved_wps = saved_wps[1:]
+        path_arr = [np.array(p) for p in [start_pos] + saved_wps]
 
-        # Timeline state (ID-20)
+        # Create flight entry in _flights dict
+        timer = QTimer(self)
+        ft = {
+            "name": name, "timer": timer, "path": path_arr, "segments": segments,
+            "seg_idx": 0, "step": 0, "formation": formation,
+            "cache": data,
+            "total_steps": total_steps, "total_time_ms": total_time_ms,
+        }
+        timer.timeout.connect(lambda n=name: self._flight_tick(n))
+        self._flights[name] = ft
+        self._flight_active = True
+        self._set_flight_ui_active(True)
+
+        # Timeline
         self._total_flight_steps = total_steps
         self._total_flight_time_ms = total_time_ms
-
         self._tl_slider.setRange(0, total_time_ms)
         self._tl_slider.setValue(0)
-        self._update_timeline_label(0)
-        num_wp = len(saved_wps) + 1  # +1 for start position
-        self._setup_keyframe_labels(num_wp)
-        self._btn_start_flight.setText("停止飞行")
-        self._flight_aircraft_combo.setEnabled(False)
-        self._btn_save_flight.setEnabled(False)
-        self._btn_load_flight.setEnabled(False)
+        self._setup_keyframe_labels(len(saved_wps) + 1)
 
-        # Restore formation followers from saved data (ID-27)
-        base_trail = self.FORMATION_TRAIL_DIST
-        if self._dem_scene_active:
-            base_trail = AIRCRAFT_DEFAULT_SCALE * 0.005
-        formation = data.get("formation", [name])
-        self._flight_aircraft_list = formation
-        self._formation_offsets.clear()
-        for j, fname in enumerate(formation[1:]):
-            offset_dist = base_trail * (j + 1)
-            self._formation_offsets[fname] = offset_dist
-            ft = self._get_or_init_transform(fname)
-            ft["offset"] = (np.array(start_pos) + np.array([-offset_dist, 0, 0])).tolist()
-            ft["yaw"] = 0.0
-            self._apply_obj_transform_to_actor(fname)
-
-        self._log_action(f"用户加载了路径规划文件：{os.path.basename(self._loaded_flight_path)}")
-        self.statusBar().showMessage(
-            f"载入飞行数据: {name}" + (f" (编队 {len(formation)}机)" if len(formation) > 1 else "") + f" ({len(segments)} 个段)", 3000
-        )
-        self._flight_timer.start(interval_ms)
+        timer.start(interval_ms)
 
 
     # ═══════════════════════════════════════════════════════════════
@@ -3945,73 +3709,56 @@ class MainWindow(QtWidgets.QMainWindow):
         self._kf_layout.addStretch()
 
     def _update_timeline(self):
-        """Sync the timeline slider with current flight progress."""
-        accum = 0
-        for i in range(self._flight_segment_idx):
-            accum += self._flight_segments[i]["steps"]
-        accum += self._flight_step
-
+        if not self._flights:
+            return
+        f = next(iter(self._flights.values()))
+        accum = sum(s["steps"] for i, s in enumerate(f["segments"]) if i < f["seg_idx"])
+        accum += f["step"]
         current_ms = 0
-        if self._total_flight_steps > 0:
-            progress = accum / self._total_flight_steps
-            current_ms = int(progress * self._total_flight_time_ms)
-
+        if f["total_steps"] > 0:
+            current_ms = int((accum / f["total_steps"]) * f["total_time_ms"])
         self._tl_slider.blockSignals(True)
         self._tl_slider.setValue(current_ms)
         self._tl_slider.blockSignals(False)
         self._update_timeline_label(current_ms)
 
     def _update_timeline_label(self, current_ms=None):
-        """Update the time label showing current / total seconds."""
         if current_ms is None:
             current_ms = self._tl_slider.value()
-        current_s = current_ms / 1000.0
-        total_s = self._total_flight_time_ms / 1000.0
-        self._tl_time_label.setText(f"{current_s:.1f} / {total_s:.1f} 秒")
+        total_s = (self._total_flight_time_ms / 1000.0) if self._total_flight_time_ms > 0 else 0
+        self._tl_time_label.setText(f"{current_ms/1000:.1f} / {total_s:.1f} 秒")
 
     # ── Timeline seek handlers ──────────────────────────────
 
     def _on_tl_pressed(self):
-        """Pause the flight timer while the user drags the timeline."""
-        if self._flight_timer.isActive():
-            self._flight_timer.stop()
+        for f in self._flights.values():
+            f["timer"].stop()
 
     def _on_tl_seek(self, value_ms):
-        """Seek to a specific time position (value in ms) during slider drag."""
-        if not self._flight_active or not self._flight_segments:
+        if not self._flights:
             return
-        total_ms = self._total_flight_time_ms
+        f = next(iter(self._flights.values()))
+        total_ms = f["total_time_ms"]
+        total_steps = f["total_steps"]
         if total_ms <= 0:
             return
-
-        progress = value_ms / total_ms
-        target_step = int(progress * self._total_flight_steps)
-        target_step = max(0, min(self._total_flight_steps - 1, target_step))
-
-        # Find segment and step
+        target_step = int((value_ms / total_ms) * total_steps)
+        target_step = max(0, min(total_steps - 1, target_step))
         accum = 0
-        for seg_idx, seg in enumerate(self._flight_segments):
+        for seg_idx, seg in enumerate(f["segments"]):
             if accum + seg["steps"] > target_step:
-                self._flight_segment_idx = seg_idx
-                self._flight_step = target_step - accum
+                f["seg_idx"] = seg_idx
+                f["step"] = target_step - accum
                 break
             accum += seg["steps"]
-
-        # Update slider value before apply so _flight_window reads correct time
         self._tl_slider.blockSignals(True)
         self._tl_slider.setValue(value_ms)
         self._tl_slider.blockSignals(False)
-
-        state = self._compute_flight_state_at(
-            self._flight_segment_idx, self._flight_step
-        )
-        self._apply_flight_state(state)
         self._update_timeline_label(value_ms)
 
     def _on_tl_released(self):
-        """Resume the flight timer after the user releases the slider."""
-        if self._flight_active:
-            self._flight_timer.start(self.FLIGHT_INTERVAL_MS)
+        for f in self._flights.values():
+            f["timer"].start(self.FLIGHT_INTERVAL_MS)
 
     # ── Independent flight window (ID-20) ──────────────────
 
@@ -4204,7 +3951,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Release VTK resources."""
         self._rec_timer.stop()
         self._river_timer.stop()
-        self._flight_timer.stop()
+        self._stop_flight()
         self._recording = False
         try:
             self.plotter.close()
