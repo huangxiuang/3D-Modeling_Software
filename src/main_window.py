@@ -3172,8 +3172,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._pending_formation_path = None
                     form = self._formations[fname]
                     form["waypoints"] = [np.array(xyz) for xyz in coords_list]
-                    for n in form["members"]:
-                        self._aircraft_waypoints[n] = [np.array(xyz) for xyz in coords_list]
                     self._rebuild_waypoint_actors()
                     self._refresh_waypoint_tree()
                     self._log_action(f"{fname} 自定义路径点: {len(coords_list)} 个")
@@ -3362,10 +3360,9 @@ class MainWindow(QtWidgets.QMainWindow):
         leader_name = wp_options[row][0]
         leader_wps = self._aircraft_waypoints.get(leader_name, [])
         form["waypoints"] = [np.array(w) for w in leader_wps]
-        for n in form["members"]:
-            self._aircraft_waypoints[n] = [np.array(w) for w in leader_wps]
         self._rebuild_waypoint_actors()
         self._refresh_waypoint_tree()
+        self._refresh_formation_tree(fname)
         self._log_action(f"{fname} 路径点来源: {leader_name} ({len(leader_wps)} 点)")
         self.statusBar().showMessage(f"{fname} 路径点已设置: {leader_name}", 3000)
 
@@ -3379,11 +3376,35 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(f"⚠ {fname} 路径点不足（≥2个）", 3000)
             return
         self._draw_flight_preview(wps)
-        for n in form["members"]:
-            self._aircraft_waypoints[n] = [np.array(w) for w in wps]
-        self._flight_aircraft_combo.setCurrentText(form["leader"])
-        self._start_flight(form["leader"])
+        # Temporarily copy to leader so _start_flight can read them
+        leader = form["leader"]
+        saved = self._aircraft_waypoints.get(leader, [])
+        self._aircraft_waypoints[leader] = [np.array(w) for w in wps]
+        self._flight_aircraft_combo.setCurrentText(leader)
+        self._start_flight(leader)
+        self._aircraft_waypoints[leader] = saved  # restore after flight starts
         self._log_action(f"{fname} 开始飞行 ({len(form['members'])} 机)")
+
+    def _refresh_formation_tree(self, fname):
+        form = self._formations.get(fname)
+        if form is None:
+            return
+        node = form.get("tree_node")
+        if node is None:
+            return
+        # Remove old wp sub-items (keep first 2: select path + start flight)
+        while node.childCount() > 2:
+            node.removeChild(node.child(2))
+        wps = form.get("waypoints", [])
+        for i, wp in enumerate(wps):
+            SceneTreeFactory._create_item(node, NodeData(
+                node_type=SceneNodeType.WAYPOINT,
+                label=f"编队路径点 {i+1}",
+                waypoint_index=i, aircraft_name=fname,
+                tooltip=f"({wp[0]:.1f}, {wp[1]:.1f}, {wp[2]:.1f})",
+                is_deletable=True,
+            ))
+        node.setExpanded(True)
 
     def _cancel_formation(self):
         if not self._formations:
