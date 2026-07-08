@@ -3797,7 +3797,7 @@ class MainWindow(QtWidgets.QMainWindow):
         timer = QTimer(self)
         ft = {
             "name": name, "timer": timer, "path": path_arr, "segments": segments,
-            "seg_idx": 0, "step": 0, "formation": formation,
+            "seg_idx": 0, "step": 0, "formation": data.get("formation", [name]),
             "cache": data,
             "total_steps": total_steps, "total_time_ms": total_time_ms,
         }
