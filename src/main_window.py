@@ -1160,8 +1160,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
             self._path_actor = None
         self._rebuild_waypoint_actors()
-        self._refresh_waypoint_tree()
         self._populate_aircraft_nodes()
+        self._refresh_waypoint_tree()
         self._log_action(f"用户删除了飞机: {name}")
 
     def _delete_waypoint(self, ac_name, wp_idx):
@@ -1210,8 +1210,15 @@ class MainWindow(QtWidgets.QMainWindow):
         flight_root = self._tree_items.get(SceneNodeType.FLIGHT_PLATFORM)
         if flight_root is None:
             return
-        while flight_root.childCount() > 0:
-            flight_root.removeChild(flight_root.child(0))
+        # Remove only aircraft nodes (preserve formation nodes)
+        i = 0
+        while i < flight_root.childCount():
+            ac = flight_root.child(i)
+            ds = ac.data(0, Qt.UserRole)
+            if ds and ds.scene_obj_name and "aircraft" in ds.scene_obj_name.lower():
+                flight_root.removeChild(ac)
+            else:
+                i += 1
         for obj_name in self.scene_objects:
             if "aircraft" not in obj_name.lower():
                 continue
@@ -3091,22 +3098,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(f"{len(coords_list)} 个路径点已添加到: {names_str}", 3000)
 
     def _refresh_waypoint_tree(self):
-        """Refresh waypoint tree nodes under all aircraft — auto-expand."""
         flight_root = self._tree_items.get(SceneNodeType.FLIGHT_PLATFORM)
         if flight_root is None:
             return
         for i in range(flight_root.childCount()):
             ac = flight_root.child(i)
-            ac_name = ac.text(0)
             ds = ac.data(0, Qt.UserRole)
             if ds and ds.scene_obj_name:
                 ac_name = ds.scene_obj_name
-            # Clear and reload
-            while ac.childCount() > 0:
-                ac.removeChild(ac.child(0))
-            self._lazy_load_waypoints(ac, ac_name)
-            if ac.childCount() > 0:
-                ac.setExpanded(True)
+                while ac.childCount() > 0:
+                    ac.removeChild(ac.child(0))
+                self._lazy_load_waypoints(ac, ac_name)
+                if ac.childCount() > 0:
+                    ac.setExpanded(True)
 
     def _toggle_wp_mode(self):
         """Toggle between WAYPOINT (click-to-place) and NORMAL mode."""
