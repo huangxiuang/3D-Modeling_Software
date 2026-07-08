@@ -2928,6 +2928,26 @@ class MainWindow(QtWidgets.QMainWindow):
             f"路径点 #{idx}:  {world_pos[0]:.2f}, {world_pos[1]:.2f}, {world_pos[2]:.2f}",
             3000,
         )
+        # Auto-expand aircraft node so user can see and edit waypoints
+        self._refresh_waypoint_tree()
+
+    def _refresh_waypoint_tree(self):
+        """Refresh waypoint tree nodes under all aircraft — auto-expand."""
+        flight_root = self._tree_items.get(SceneNodeType.FLIGHT_PLATFORM)
+        if flight_root is None:
+            return
+        for i in range(flight_root.childCount()):
+            ac = flight_root.child(i)
+            ac_name = ac.text(0)
+            ds = ac.data(0, Qt.UserRole)
+            if ds and ds.scene_obj_name:
+                ac_name = ds.scene_obj_name
+            # Clear and reload
+            while ac.childCount() > 0:
+                ac.removeChild(ac.child(0))
+            self._lazy_load_waypoints(ac, ac_name)
+            if ac.childCount() > 0:
+                ac.setExpanded(True)
 
     def _toggle_wp_mode(self):
         """Toggle between WAYPOINT (click-to-place) and NORMAL mode."""
