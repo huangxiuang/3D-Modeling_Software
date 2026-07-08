@@ -3376,13 +3376,24 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(f"⚠ {fname} 路径点不足（≥2个）", 3000)
             return
         self._draw_flight_preview(wps)
-        # Temporarily copy to leader so _start_flight can read them
         leader = form["leader"]
         saved = self._aircraft_waypoints.get(leader, [])
         self._aircraft_waypoints[leader] = [np.array(w) for w in wps]
         self._flight_aircraft_combo.setCurrentText(leader)
         self._start_flight(leader)
-        self._aircraft_waypoints[leader] = saved  # restore after flight starts
+        self._aircraft_waypoints[leader] = saved
+
+        trail = 3.0
+        if self._dem_scene_active:
+            trail = AIRCRAFT_DEFAULT_SCALE * 0.005
+        flight = self._flights.get(leader)
+        if flight:
+            flight["formation"] = list(form["members"])
+            flight["formation_offsets"] = {}
+            for j, fname in enumerate(form["members"][1:]):
+                flight["formation_offsets"][fname] = trail * (j + 1)
+                self._get_or_init_transform(fname)
+
         self._log_action(f"{fname} 开始飞行 ({len(form['members'])} 机)")
 
     def _refresh_formation_tree(self, fname):
@@ -3593,6 +3604,17 @@ class MainWindow(QtWidgets.QMainWindow):
             exit_pitch = float(segments[seg_idx+1]["pitch"]) if seg_idx+1 < len(segments) else entry_pitch
             pitch = max(-90.0, min(90.0, entry_pitch + (exit_pitch - entry_pitch) * t_val))
             self._apply_flight_state_single(name, pos, yaw, pitch)
+            # Update formation followers: trail behind leader
+            offsets = f.get("formation_offsets", {})
+            for fname, d in offsets.items():
+                if fname in self._obj_transforms:
+                    yaw_rad = math.radians(yaw)
+                    fx = pos[0] - math.cos(yaw_rad) * d
+                    fy = pos[1] - math.sin(yaw_rad) * d
+                    fz = pos[2]
+                    self._obj_transforms[fname]["offset"] = [fx, fy, fz]
+                    self._obj_transforms[fname]["yaw"] = yaw
+                    self._apply_obj_transform_to_actor(fname)
             self._update_timeline()
             f["step"] += 1
             if f["step"] >= steps_in_seg:
