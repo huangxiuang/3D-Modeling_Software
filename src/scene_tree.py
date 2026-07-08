@@ -193,7 +193,7 @@ class SceneTreeFactory:
 
         # -- Path Planning children --------------------------------------
         path_children: List[tuple] = [
-            ("添加3D路径点（双击后单击场景）",   SceneNodeType.PATH_ACTION, "_toggle_wp_mode"),
+            ("添加/停止添加3D路径点（双击）",   SceneNodeType.PATH_ACTION, "_toggle_wp_mode"),
             ("精准添加路径（双击）",     SceneNodeType.PATH_ACTION, "_open_precise_wp_dialog"),
             ("清除所有路径点（双击）",   SceneNodeType.PATH_ACTION, "_clear_waypoints"),
         ]
