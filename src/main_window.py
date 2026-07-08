@@ -2538,14 +2538,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 extra["Y"] = Y_2d
                 self._rebuild_actor("terrain")
             else:
-                # Normal scene: just restore Z values on existing mesh
+                # Normal scene: restore Z values, check shape compatibility
                 mesh = terrain_info["mesh"]
                 extra["original_z"] = Z_2d
                 pts = mesh.points
-                pts[:, 2] = Z_2d.flatten(order="F")
-                mesh.points = pts
-                mesh["elevation"] = Z_2d.flatten(order="F")
-                self._rebuild_actor("terrain")
+                if len(pts) == Z_2d.size:
+                    pts[:, 2] = Z_2d.flatten(order="F")
+                    mesh.points = pts
+                    mesh["elevation"] = Z_2d.flatten(order="F")
+                    self._rebuild_actor("terrain")
 
             # In DEM mode, skip sand/grass/earth layers (DEM scenes don't use them)
             if not self._is_dem_scene():
