@@ -43,10 +43,17 @@ except ImportError:
     _HAS_MPL = False
 
 from src.config import (
-    DEFAULT_CONFIG,
-    load_config,
-    save_config,
-    COORD_SYSTEMS,
+    DEFAULT_CONFIG, load_config, save_config, COORD_SYSTEMS,
+    AIRCRAFT_DEFAULT_SCALE_DEFAULT,
+    DEFAULT_CAMERA_POSITION, DEFAULT_CAMERA_FOCAL, DEFAULT_CAMERA_UP,
+    DEFAULT_SLIDER_RANGE_XY, DEFAULT_SLIDER_RANGE_Z,
+    DEM_SLIDER_Z_MIN, DEM_SLIDER_Z_MAX,
+    FLIGHT_TIMER_INTERVAL, FLIGHT_CRUISE_SPEED,
+    FORMATION_TRAIL_DISTANCE, FORMATION_TRAIL_DISTANCE_DEM,
+    CELL_PICKER_TOLERANCE, TRANSFORM_LOG_DEBOUNCE_MS,
+    DEFAULT_GROUND_PLANE_SIZE,
+    DEM_DEFAULT_STEP, DEM_DEFAULT_VERT_EXAG, DEM_VERT_EXAG_MIN, DEM_VERT_EXAG_MAX,
+    SAVE_DIR_AIRCRAFT, SAVE_DIR_TERRAIN, SAVE_DIR_FLIGHT,
 )
 from src.interaction import InteractionMode
 from src.scene_tree import SceneNodeType, NodeData, SceneTreeFactory
@@ -161,9 +168,9 @@ class ClickablePlotter(pvqt.QtInteractor):
 class MainWindow(QtWidgets.QMainWindow):
     """Top-level application window."""
 
-    # Save/load data directories (ID-10)
-    SAVE_DIR_AIRCRAFT = "data/aircraft"
-    SAVE_DIR_TERRAIN = "data/terrain"
+    # Save/load data directories
+    SAVE_DIR_AIRCRAFT = SAVE_DIR_AIRCRAFT
+    SAVE_DIR_TERRAIN = SAVE_DIR_TERRAIN
 
     # ── lifecycle ─────────────────────────────────────
 
@@ -256,6 +263,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._formation_aircraft = []   # [name, ...]  first = leader, rest = followers
         self._formation_offsets = {}    # name → float trail distance
 
+        # Undo stack for slider adjustments (max 20 entries per object)
+        self._undo_stack = []           # [(name, {"offset": [...], "scale": ..., "yaw": ..., "pitch": ..., "roll": ...})]
+
         # Timeline (ID-20)
         self._total_flight_steps = 0
         self._total_flight_time_ms = 0
@@ -298,13 +308,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.show()
 
+        # ── Ctrl+Z undo shortcut ──
+        undo_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+Z"), self)
+        undo_shortcut.activated.connect(self._undo_last_transform)
+
 
     # ═══════════════════════════════════════════════════════════════
     #  Scene management
     # ═══════════════════════════════════════════════════════════════
 
     def _init_scene(self):
-        """Build and display the default scene."""
+        """Build and display the default scene. Resets camera to fit default scale."""
         p = self.plotter
         p.background_color = self.config["bg_color"]
 
@@ -323,9 +337,103 @@ class MainWindow(QtWidgets.QMainWindow):
             if obj.get("visible", True):
                 self._add_actor(name, obj)
 
-        p.camera_position = [(18, -16, 8), (0, 0, 2), (0, 0, 1)]
-        p.camera.focal_point = (0, 0, 1.5)
+        # Always reset camera to default — critical when switching from DEM
+        p.camera_position = [
+            DEFAULT_CAMERA_POSITION,
+            DEFAULT_CAMERA_FOCAL,
+            DEFAULT_CAMERA_UP,
+        ]
+        p.camera.focal_point = DEFAULT_CAMERA_FOCAL
+        p.camera.clipping_range = (0.1, 100.0)
         p.render()
+        self._dem_scene_active = False
+        self._log_action("加载默认场景")
+
+    # ── Event-driven terrain change broadcast ─────────
+
+    def _on_terrain_changed(self, source_path=""):
+        """Event handler: broadcast terrain change to all dependent subsystems."""
+        # 0. Stop any active flight (old paths invalid on new terrain)
+        if self._flight_active:
+            self._stop_flight()
+        self._flight_segments = []
+        self._flight_path = []
+
+        # 1. Clear stale waypoints (global + per-aircraft)
+        self._clear_waypoints()
+
+        # 2. Update config
+        if source_path:
+            self.config["dem_source_path"] = source_path
+            save_config(self.config)
+
+        # 3. Refresh UI
+        self._refresh_obj_combo()
+        self._refresh_scene_objects_ui()
+        self._sync_obj_combo_selection("aircraft")
+        self._lazy_load_waypoints(
+            self._tree_items.get(SceneNodeType.AIRCRAFT), "aircraft")
+
+        # 4. Log
+        mode = "DEM" if self._dem_scene_active else "默认"
+        self._log_action(f"地形已变更 ({mode}场景) — 飞行已停止，路径点已清空")
+
+        if self._dem_scene_active:
+            self.statusBar().showMessage("DEM 地形已加载 — 路径点已清空，相机已适配", 5000)
+
+    def _reapply_elevation_scale(self):
+        """Allow user to re-adjust Z exaggeration after DEM import — live update.
+        
+        Rebuilds terrain mesh with new vert_exag, updates actors, and logs."""
+        if not self._dem_scene_active:
+            QtWidgets.QMessageBox.information(self, "提示",
+                "当前未加载 DEM 地形，无需调整垂直夸张系数。\n"
+                "请先通过 文件 → 导入 DEM 模型 加载地形。")
+            return
+
+        info = self.scene_objects.get("terrain")
+        if info is None:
+            return
+
+        original_z = info.get("extra", {}).get("original_z")
+        if original_z is None:
+            QtWidgets.QMessageBox.warning(self, "无法调整",
+                "未找到原始高程数据（original_z），无法重新计算夸张系数。")
+            return
+
+        current = self.config.get("elevation_scale", DEM_DEFAULT_VERT_EXAG)
+        new_ve, ok = QtWidgets.QInputDialog.getDouble(
+            self, "重新调整 Z 夸张",
+            "垂直夸张系数 (Z exaggeration):\n"
+            ">1 拉高山脉, <1 压低地形",
+            value=current, min=DEM_VERT_EXAG_MIN, max=DEM_VERT_EXAG_MAX, decimals=1,
+        )
+        if not ok or abs(new_ve - current) < 0.01:
+            return
+
+        try:
+            import numpy as np
+            xx = info["extra"]["X"]
+            yy = info["extra"]["Y"]
+            z_scaled = original_z * new_ve
+            pts = np.column_stack((xx.ravel(), yy.ravel(), z_scaled.ravel()))
+            grid = pv.StructuredGrid()
+            grid.points = pts.astype(np.float32)
+            grid.dimensions = (original_z.shape[1], original_z.shape[0], 1)
+            grid["elevation"] = z_scaled.ravel()
+            info["mesh"] = grid
+
+            self._rebuild_actor("terrain")
+            self.config["elevation_scale"] = new_ve
+            save_config(self.config)
+            self.plotter.render()
+            self._log_action(
+                f"重新调整 Z 垂直夸张: {current:.1f} → {new_ve:.1f}")
+            self.statusBar().showMessage(
+                f"Z 夸张已更新: {current:.1f} → {new_ve:.1f}", 5000)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "调整失败",
+                f"无法应用新的垂直夸张系数:\n{e}")
 
     # ── Actor CRUD ──────────────────────────────────
 
@@ -487,6 +595,8 @@ class MainWindow(QtWidgets.QMainWindow):
         tm.addAction("撤销上一步测量", self.meas_tool.undo_last)
         tm.addSeparator()
         tm.addAction("碰撞检测...", self._run_collision_check)
+        tm.addSeparator()
+        tm.addAction("重新调整 Z 垂直夸张...", self._reapply_elevation_scale)
         tm.addSeparator()
 
         # ── Layer management ──
@@ -846,6 +956,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.meas_tool.clear_all()
         elif slot == "meas_tool.undo_last":
             self.meas_tool.undo_last()
+        elif slot == "_clear_waypoints":
+            self._confirm_clear_waypoints()
         else:
             method = getattr(self, slot, None)
             if method and callable(method):
@@ -909,12 +1021,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_tree_delete(self):
         item = self._scene_browser.currentItem()
         if item is None:
+            self.statusBar().showMessage("⚠ 请先在场景树中选中要删除的节点", 3000)
             return
         data = item.data(0, Qt.UserRole)
         if data is None:
             return
         if not data.is_deletable:
-            QtWidgets.QMessageBox.information(self, "提示", "节点不可删除")
+            QtWidgets.QMessageBox.information(self, "提示", "该节点不可删除（受系统保护）")
             return
         reply = QtWidgets.QMessageBox.question(self, "确认删除",
             "确定要删除此节点吗?")
@@ -1769,6 +1882,48 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pending_transform_log = clean
         self._transform_log_timer.start(1500)
 
+    def _push_undo(self, name):
+        """Snapshot current transform state before slider change for Ctrl+Z undo."""
+        t = self._obj_transforms.get(name)
+        if t is None:
+            return
+        snapshot = {
+            "offset": list(t.get("offset", [0, 0, 0])),
+            "scale": t.get("scale", 1.0),
+            "yaw": t.get("yaw", 0.0),
+            "pitch": t.get("pitch", 0.0),
+            "roll": t.get("roll", 0.0),
+        }
+        self._undo_stack.append((name, snapshot))
+        if len(self._undo_stack) > 50:  # cap at 50 entries
+            self._undo_stack.pop(0)
+
+    def _undo_last_transform(self):
+        """Restore the last undo snapshot (Ctrl+Z handler)."""
+        if not self._undo_stack:
+            self.statusBar().showMessage("没有可撤销的操作", 2000)
+            return
+        name, snap = self._undo_stack.pop()
+        t = self._obj_transforms.get(name)
+        if t is None:
+            return
+        t["offset"] = snap["offset"]
+        t["scale"] = snap["scale"]
+        t["yaw"] = snap["yaw"]
+        t["pitch"] = snap["pitch"]
+        t["roll"] = snap["roll"]
+        self._apply_obj_transform_to_actor(name)
+        # Update UI sliders to reflect restored state
+        self._set_slider_value(self._slider_obj_x, snap["offset"][0])
+        self._set_slider_value(self._slider_obj_y, snap["offset"][1])
+        self._set_slider_value(self._slider_obj_z, snap["offset"][2])
+        self._set_slider_value(self._slider_obj_s, snap["scale"])
+        self._set_slider_value(self._slider_obj_yaw, snap["yaw"])
+        self._set_slider_value(self._slider_obj_pitch, snap["pitch"])
+        self._set_slider_value(self._slider_obj_roll, snap["roll"])
+        self._log_action(f"用户撤销了【{name}】的变换")
+        self.statusBar().showMessage(f"已撤销【{name}】的变换", 2000)
+
     def _flush_transform_log(self):
         if self._pending_transform_log is None:
             return
@@ -1787,6 +1942,7 @@ class MainWindow(QtWidgets.QMainWindow):
         clean = name.replace("[自定义] ", "")
         if clean not in self._obj_transforms:
             return
+        self._push_undo(clean)
         self._obj_transforms[clean]["offset"][0] = val
         self._apply_obj_transform_to_actor(clean)
         self._schedule_transform_log(clean)
@@ -1796,6 +1952,7 @@ class MainWindow(QtWidgets.QMainWindow):
         clean = name.replace("[自定义] ", "")
         if clean not in self._obj_transforms:
             return
+        self._push_undo(clean)
         self._obj_transforms[clean]["offset"][1] = val
         self._apply_obj_transform_to_actor(clean)
         self._schedule_transform_log(clean)
@@ -1805,6 +1962,7 @@ class MainWindow(QtWidgets.QMainWindow):
         clean = name.replace("[自定义] ", "")
         if clean not in self._obj_transforms:
             return
+        self._push_undo(clean)
         self._obj_transforms[clean]["offset"][2] = val
         self._apply_obj_transform_to_actor(clean)
         self._schedule_transform_log(clean)
@@ -1814,6 +1972,7 @@ class MainWindow(QtWidgets.QMainWindow):
         clean = name.replace("[自定义] ", "")
         if clean not in self._obj_transforms:
             return
+        self._push_undo(clean)
         self._obj_transforms[clean]["scale"] = val
         self._apply_obj_transform_to_actor(clean)
 
@@ -1822,6 +1981,7 @@ class MainWindow(QtWidgets.QMainWindow):
         clean = name.replace("[自定义] ", "")
         if clean not in self._obj_transforms:
             return
+        self._push_undo(clean)
         self._obj_transforms[clean]["yaw"] = val
         self._apply_obj_transform_to_actor(clean)
 
@@ -1830,6 +1990,7 @@ class MainWindow(QtWidgets.QMainWindow):
         clean = name.replace("[自定义] ", "")
         if clean not in self._obj_transforms:
             return
+        self._push_undo(clean)
         self._obj_transforms[clean]["pitch"] = val
         self._apply_obj_transform_to_actor(clean)
 
@@ -1838,6 +1999,7 @@ class MainWindow(QtWidgets.QMainWindow):
         clean = name.replace("[自定义] ", "")
         if clean not in self._obj_transforms:
             return
+        self._push_undo(clean)
         self._obj_transforms[clean]["roll"] = val
         self._apply_obj_transform_to_actor(clean)
 
@@ -1860,11 +2022,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         elif mode in (InteractionMode.MEASURE_DISTANCE, InteractionMode.MEASURE_ANGLE):
             if np.linalg.norm(world_pos) < 1e-6:
+                self.statusBar().showMessage("⚠ 点击位置未命中地形表面，请重试", 2000)
                 return
             self.meas_tool.add_point(world_pos)
 
         elif mode == InteractionMode.WAYPOINT:
             if np.linalg.norm(world_pos) < 1e-6:
+                self.statusBar().showMessage("⚠ 点击位置未命中地形表面，请重试", 2000)
                 return
             self._add_waypoint(world_pos)
 
@@ -1962,6 +2126,14 @@ class MainWindow(QtWidgets.QMainWindow):
         p.render()
 
     def _reset_all(self):
+        reply = QtWidgets.QMessageBox.question(
+            self, "确认全局复位",
+            "确定要将所有对象恢复到初始位置和姿态吗？\n\n"
+            "所有手动调整的位移、旋转、缩放将丢失。\n"
+            "此操作不可撤销。",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
         for name in list(self._obj_transforms.keys()):
             center = self._compute_obj_center(name)
             self._obj_transforms[name] = {
@@ -2483,7 +2655,7 @@ class MainWindow(QtWidgets.QMainWindow):
             f"({dem['rows']}×{dem['cols']}, "
             f"Z {dem['z'].min():.0f}~{dem['z'].max():.0f}m)", 8000
         )
-        
+        self._on_terrain_changed(path)
 
     # ═══════════════════════════════════════════════════════════════
     #  ASC grid import/export
@@ -2777,7 +2949,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._add_waypoint(np.array(xyz))
 
     def _clear_waypoints(self):
+        if not self.waypoints and not self._wp_actors and not any(self._aircraft_waypoints.values()):
+            return
+        count = len(self.waypoints)
         self.waypoints.clear()
+        self._aircraft_waypoints.clear()  # clear per-aircraft waypoints too
         for a in self._wp_actors:
             self.plotter.remove_actor(a)
         self._wp_actors.clear()
@@ -2785,7 +2961,22 @@ class MainWindow(QtWidgets.QMainWindow):
             self.plotter.remove_actor(self._path_actor)
             self._path_actor = None
         self.plotter.render()
-        self._log_action("用户清除了当前所有飞行路径点")
+        self._log_action(f"用户清除了 {count} 个飞行路径点")
+
+    def _confirm_clear_waypoints(self):
+        """Show confirmation dialog before clearing all waypoints."""
+        total = len(self.waypoints) + sum(len(v) for v in self._aircraft_waypoints.values())
+        if total == 0:
+            self.statusBar().showMessage("⚠ 没有可清除的路径点", 3000)
+            return
+        reply = QtWidgets.QMessageBox.question(
+            self, "确认清除",
+            f"确定要清除所有路径点吗？\n\n"
+            f"共 {total} 个路径点将被永久删除。\n"
+            f"此操作不可撤销。",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+        if reply == QtWidgets.QMessageBox.Yes:
+            self._clear_waypoints()
 
     # ═══════════════════════════════════════════════════════════════
     #  Flight animation (ID-11)
@@ -2807,6 +2998,13 @@ class MainWindow(QtWidgets.QMainWindow):
     # ── Formation flight (ID-27) ──────────────────────────
 
     def _on_formation_toggled(self, checked):
+        if checked:
+            ac_count = sum(1 for n in self.scene_objects if "aircraft" in n.lower())
+            if ac_count < 1:
+                self.statusBar().showMessage("⚠ 当前场景无飞机，无法开启编队", 3000)
+                self._formation_mode = False
+                self._btn_formation.setChecked(False)
+                return
         self._formation_mode = checked
         self._formation_list.setVisible(checked)
         if checked:
@@ -3609,6 +3807,8 @@ class MainWindow(QtWidgets.QMainWindow):
     # ═══════════════════════════════════════════════════════════════
 
     def _log_action(self, msg):
+        if not hasattr(self, '_log_text') or self._log_text is None:
+            return
         import datetime
         ts = datetime.datetime.now().strftime("%H:%M:%S")
         self._log_text.append(f"[{ts}] {msg}")

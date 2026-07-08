@@ -202,5 +202,61 @@ SMALL change:
 | V1.0 | 2026-06-29 | 初始版本，完整功能基线 |
 | V1.6 | 2026-07-03 | 删除东北天坐标输入、隐藏高程标量条、图层初始100%透明、时间轴常驻主界面、FlightPlotter延迟渲染修复FlightWindow崩溃 |
 | V1.8 | 2026-07-03 | 独立飞行窗口完全删除(改为全主视口飞行)、沙地/草地/土地图层默认不勾选(勾选后显示全彩) |
+| V2.0 | 2026-07-06 | PyVista extract_surface崩溃修复, 多项功能新增 |
+| V2.2 | 2026-07-06 | 图层管理对话框, DEM保存/载入修复, 3D交互鲁棒性改进 |
+| V2.4 | 2026-07-08 | UI重构(场景树+属性面板), ASC导入导出, 编队修复, Rosetta2 VTK启动修复, Retina鼠标修复 |
+| **V2.5** | **2026-07-08** | **Enterprise重构: 事件驱动架构 + 魔法数字集中化 + DEM场景切换修复 + Z夸张实时重调 + UX防御** |
+
+---
+
+## Architecture (v2.5)
+
+```
+src/
+├── config.py              [Data Layer] — 全局常量 + 配置持久化 (30+ 魔法数字)
+├── interaction.py         [UI Layer]   — 交互模式枚举 (NORMAL/MEASURE/WAYPOINT)
+├── measurement.py         [Biz Logic]  — 测距/测角 (自动写入日志)
+├── collision.py           [Biz Logic]  — 碰撞检测
+├── scene_tree.py          [UI Layer]   — 场景树模型 + 工厂
+├── scene_builder.py       [Biz Logic]  — 默认场景 + 地形图层
+├── dem_loader.py          [Data Layer] — DEM文件加载 + DEM场景构建
+├── layer_dialog.py        [UI Layer]   — 图层管理对话框
+├── main_window.py         [Orchestrator] — 主窗口: UI组装 + 事件路由 + 全局状态
+│
+└── 3DSceneSoftware_test2.py [Entry]    — 应用入口
+```
+
+**事件驱动链路 (v2.5 新增)**:
+
+```
+DEM导入 / 默认场景加载
+  → _on_terrain_changed(path)
+    ├── _clear_waypoints()         # 清空旧路径
+    ├── save_config()              # 持久化 config
+    ├── _refresh_obj_combo()       # 刷新飞机列表
+    ├── _lazy_load_waypoints()     # 刷新路径点面板
+    ├── _log_action("地形已变更")   # 自动日志
+    └── statusbar("路径点已清空")    # 用户提示
+
+Z夸张重调:
+  → _reapply_elevation_scale()
+    ├── 重建 StructuredGrid (original_z × new_scale)
+    ├── _rebuild_actor("terrain")
+    ├── save_config()
+    ├── plotter.render()
+    └── _log_action("Z垂直夸张: X → Y")
+```
+
+**魔法数字映射 (config.py → main_window)**:
+| 原硬编码 | 新位置 | 值 |
+|----------|--------|-----|
+| `step=2` | DEM_DEFAULT_STEP | 2 |
+| `7000.0` | DEM_AIRCRAFT_Z | 7000.0 |
+| `(18,-16,8)` | DEFAULT_CAMERA_POSITION | (18,-16,8) |
+| `(0,0,1.5)` | DEFAULT_CAMERA_FOCAL | (0,0,1.5) |
+| `-500,10000` | DEM_SLIDER_Z_MIN/MAX | (-500,10000) |
+| `5.0` | FLIGHT_CRUISE_SPEED | 5.0 |
+| `0.003` | FORMATION_TRAIL_DISTANCE | 0.003 |
+| `1500` | TRANSFORM_LOG_DEBOUNCE_MS | 1500 |
 | V2.0 | 2026-07-06 | 修复 `extract_surface(algorithm=None)` PyVista 版本兼容崩溃 (ID-28)、Qt HiDPI 属性设置顺序修正、新增 DEM 高程模型导入文档 |
 | V2.4 | 2026-07-07 | 重构UI为树视图+属性面板、删除坐标系切换(统一X/Y/Z)、删除场景设置/地图背景切换按钮、新增ASC格网数据导入导出、修复飞行按钮/编队重叠/飞机命名/添加飞机崩溃/DEM对象控制 |
