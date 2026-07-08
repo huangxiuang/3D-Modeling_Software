@@ -3497,11 +3497,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._flight_active:
             self._set_flight_ui_active(True)
         self._flight_active = True
-        # Update timeline for first flight
         self._total_flight_steps = total_steps
         self._total_flight_time_ms = total_time_ms
+        self._tl_slider.blockSignals(True)
         self._tl_slider.setRange(0, total_time_ms)
         self._tl_slider.setValue(0)
+        self._tl_slider.blockSignals(False)
         self._setup_keyframe_labels(len(aircraft_wps))
         self._btn_start_flight.setText("停止飞行")
         timer.start(self.FLIGHT_INTERVAL_MS)
