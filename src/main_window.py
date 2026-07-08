@@ -3509,6 +3509,21 @@ class MainWindow(QtWidgets.QMainWindow):
             self._set_flight_ui_active(False)
             self._log_action("飞行停止")
 
+    @staticmethod
+    def _catmull_rom_position(path, seg_idx, t):
+        n = len(path)
+        p1, p2 = path[seg_idx], path[min(seg_idx+1, n-1)]
+        p0 = path[seg_idx-1] if seg_idx > 0 else 2*p1 - p2
+        p3 = path[seg_idx+2] if seg_idx+2 < n else 2*p2 - p1
+        t2, t3 = t*t, t*t*t
+        return 0.5 * ((2*p1) + (-p0+p2)*t + (2*p0-5*p1+4*p2-p3)*t2 + (-p0+3*p1-3*p2+p3)*t3)
+
+    @staticmethod
+    def _lerp_angle(a, b, t):
+        d = (b - a) % 360.0
+        if d > 180.0: d -= 360.0
+        return (a + d * t) % 360.0
+
     def _flight_tick(self, name):
         f = self._flights.get(name)
         if f is None:
