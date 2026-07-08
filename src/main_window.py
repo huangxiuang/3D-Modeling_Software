@@ -1245,11 +1245,46 @@ class MainWindow(QtWidgets.QMainWindow):
             self._obj_combo.blockSignals(False)
             self._on_obj_select_changed(idx)
 
+    def _open_flight_aircraft_dialog(self):
+        """Show independent dialog to select which aircraft to fly."""
+        names = [n for n in self.scene_objects if "aircraft" in n.lower()]
+        if not names:
+            self.statusBar().showMessage("⚠ 当前场景无飞机", 3000)
+            return
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("选择飞行飞机")
+        dlg.setWindowFlags(dlg.windowFlags() | QtCore.Qt.Window)
+        dlg.resize(320, 250)
+        lo = QtWidgets.QVBoxLayout(dlg)
+        lo.addWidget(QtWidgets.QLabel("请选择要执行飞行的飞机:"))
+        lst = QtWidgets.QListWidget()
+        for n in names:
+            item = QtWidgets.QListWidgetItem(n)
+            if n == self._flight_aircraft_combo.currentText():
+                item.setSelected(True)
+            lst.addItem(item)
+        lo.addWidget(lst)
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        lo.addWidget(btns)
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        sel = lst.currentItem()
+        if sel is None:
+            return
+        # Set combo and start flight
+        idx = self._flight_aircraft_combo.findText(sel.text())
+        if idx >= 0:
+            self._flight_aircraft_combo.setCurrentIndex(idx)
+        self._start_flight()
+
     def _toggle_flight(self):
         if self._flight_active:
             self._stop_flight()
         else:
-            self._start_flight()
+            self._open_flight_aircraft_dialog()
 
     # ── Slider factory ─────────────────────────────
 
