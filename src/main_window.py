@@ -1040,6 +1040,12 @@ class MainWindow(QtWidgets.QMainWindow):
             if parent:
                 parent.removeChild(item)
             self._refresh_ui()
+        elif data.node_type == SceneNodeType.WAYPOINT:
+            self._delete_waypoint(data.aircraft_name, data.waypoint_index)
+            parent = item.parent()
+            if parent:
+                parent.removeChild(item)
+            self._rebuild_waypoint_actors()
 
     def _on_tree_rename_item(self, item):
         idx = self._scene_browser.indexOfTopLevelItem(item)
