@@ -1036,6 +1036,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if parent:
                 parent.removeChild(item)
             self._rebuild_waypoint_actors()
+        elif "编队" in data.label:
+            self._cancel_formation()
+            # Tree node removal handled by _cancel_formation
 
     def _on_tree_rename_item(self, item):
         idx = self._scene_browser.indexOfTopLevelItem(item)
@@ -1139,10 +1142,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._obj_transforms.pop(name, None)
         self._aircraft_waypoints.pop(name, None)
         self._aircraft_colors.pop(name, None)
-        # Remove from formation list if present
-        if name in self._formation_aircraft:
-            self._formation_aircraft.remove(name)
-            self._formation_offsets.pop(name, None)
+        self._stop_flight(name)
+        # Remove from formation if member of any
+        for fname, form in list(self._formations.items()):
+            if name in form["members"]:
+                form["members"].remove(name)
+        if any(not f["members"] for f in self._formations.values()):
+            self._formations.clear()
+            self._btn_formation.setText("开始编队")
+            self._btn_formation.setEnabled(True)
+            self._btn_cancel_formation.setVisible(False)
         # Clean up flight preview line if present
         if self._path_actor is not None:
             try:
@@ -3269,6 +3278,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 node_type=SceneNodeType.GLOBAL_TOOL,
                 label=label, tooltip=f"编队成员: {', '.join(members)}",
                 icon_name=SceneNodeType.GLOBAL_TOOL,
+                is_deletable=True,
             ),
         )
         # Add sub-items: select waypoints + start flight
@@ -3307,7 +3317,7 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg = QtWidgets.QDialog(self)
         dlg.setWindowTitle(f"{fname} — 选择路径点")
         dlg.setWindowFlags(dlg.windowFlags() | QtCore.Qt.Window)
-        dlg.resize(350, 250)
+        dlg.resize(360, 280)
         lo = QtWidgets.QVBoxLayout(dlg)
         lo.addWidget(QtWidgets.QLabel(f"为 {fname} ({', '.join(form['members'])}) 选择路径点:"))
         sel = QtWidgets.QListWidget()
@@ -3318,26 +3328,31 @@ class MainWindow(QtWidgets.QMainWindow):
         lo.addWidget(sel)
         lo.addWidget(QtWidgets.QLabel("或:"))
         btn_custom = QtWidgets.QPushButton("自定义编队路径点 (XY图)")
-        dlg._result = None
-        def _set_custom():
-            setattr(dlg, '_result', 'custom')
-            dlg.accept()
-        btn_custom.clicked.connect(_set_custom)
         lo.addWidget(btn_custom)
-        btns = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-        btns.accepted.connect(lambda: setattr(dlg, '_result', sel.currentRow() if sel.count() > 0 else None))
-        btns.rejected.connect(dlg.reject)
+        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         lo.addWidget(btns)
-        if dlg.exec_() != QtWidgets.QDialog.Accepted or dlg._result is None:
+
+        # Result handling: 'custom'=XY dialog, index=int=use that aircraft's waypoints
+        result_ref = [None]  # mutable container for closure capture
+        def _on_ok():
+            result_ref[0] = sel.currentRow() if sel.currentRow() >= 0 else None
+            dlg.accept()
+        def _on_custom():
+            result_ref[0] = 'custom'
+            dlg.accept()
+        btns.accepted.connect(_on_ok)
+        btns.rejected.connect(dlg.reject)
+        btn_custom.clicked.connect(_on_custom)
+
+        if dlg.exec_() != QtWidgets.QDialog.Accepted or result_ref[0] is None:
             return
 
-        if dlg._result == 'custom':
+        if result_ref[0] == 'custom':
             self._pending_formation_path = fname
             self._open_precise_wp_dialog()
             return
 
-        row = dlg._result
+        row = result_ref[0]
         if row < 0 or row >= len(wp_options):
             return
         leader_name = wp_options[row][0]
