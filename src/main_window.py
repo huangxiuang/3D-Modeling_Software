@@ -305,6 +305,7 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QApplication.instance().aboutToQuit.connect(self._cleanup)
 
         self.show()
+        self._log_action("您好用户，欢迎使用本 3D 场景建模软件！首次使用请阅读用户手册 — 帮助 → 用户手册")
 
         # ── Ctrl+Z undo shortcut ──
         undo_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+Z"), self)
