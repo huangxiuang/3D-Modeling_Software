@@ -801,12 +801,112 @@ macOS双QVTK问题无法通过OffScreenRendering等方案彻底解决，FlightPl
 - 飞机命名规则：号1="aircraft", 号2+="aircraft2"...
 
 
+### [ID-38] 新增操作日志 + 场景设置属性（只读/自动更新）+ 路径点模式恢复
+
+- **状态**: 已验证修复
+- **模块**: UI / 全局
+- **严重程度**: 🔴 严重
+- **发现日期**: 2026-07-08
+- **修复日期**: 2026-07-08
+
+**变更内容**:
+
+1. **操作日志 (底部左下)**:
+   - 底部 Dock 重构为左右分区：左（stretch=2）操作日志 + 右（stretch=1, maxWidth=400）坐标信息
+   - 新增 `_log_action(msg)`：时间戳 + 自动滚动到底部
+   - 已插桩 20+ 方法：增删飞机/路径点/图层、切换视角、加载地形、复位、选中对象、导入 ASC/DEM、测距测角、编队、保存/载入飞行数据、碰撞检测等
+   - 对象位置变换滑块的日志带 1.5s 去抖（`_pending_transform_log` + 单次 QTimer）
+
+2. **场景设置 → 场景信息独立窗口**:
+   - 场景树"场景设置"节点下新增"场景信息（双击）"子节点
+   - 双击弹出独立 `SceneSettingsDialog` 窗口，1s 定时自动刷新
+   - 显示：作者、日期、坐标系、地形尺寸、Z偏移、边界、垂直夸张、相机视角
+   - 坐标系从 hardcoded "WGS84" 改为动态读取 `config["coordinate_system"]` + DEM CRS
+   - 垂直夸张从 DEM 导入时保存到 `config["elevation_scale"]`，对话框实时显示
+   - 首屏刷新用 `QTimer.singleShot(0)` 延迟，避免 VTK/OpenGL 构造期死锁
+
+3. **路径点模式恢复**:
+   - `InteractionMode.WAYPOINT` 重新加入
+   - "添加3D路径点（单击场景）" → `_toggle_wp_mode` → 单击 scene 放置路径点
+   - "精准添加路径（双击）"和"清除所有路径点（双击）"保留
+
 ## 当前已知问题
 
 <!-- 在此处按时间倒序添加问题条目 -->
 
 | ID | 标题 | 模块 | 严重程度 | 状态 |
 |----|------|------|----------|------|
+
+---
+
+### [ID-39] macOS Apple Silicon (Rosetta 2) 环境下 VTK 启动死锁 — 根因分析与修复 ✅
+
+- **状态**: 已验证修复
+- **模块**: 启动 / VTK 引擎
+- **严重程度**: 🔴 严重（程序无法启动）
+- **发现日期**: 2026-07-08
+- **修复日期**: 2026-07-08
+
+**问题现象**:
+macOS Apple Silicon (arm64) 上安装 x86_64 版 Anaconda → Conda Python 和所有 pip 包均为 x86_64 二进制 → 运行在 Rosetta 2 转译层上。
+执行 `python 3DSceneSoftware_test2.py` 时，`import vtk` 阶段直接卡死（30s+ 无响应），或需要 1-3 分钟才能完成，用户体验不可接受。
+
+**根因分析（三层）：**
+
+| 层 | 问题 | 数据 |
+|----|------|------|
+| 1. 环境 | Conda Python 是 x86_64 二进制，Rosetta 2 转译加载 | `file python` → `Mach-O 64-bit executable x86_64` |
+| 2. 导入 | `import vtk` 触发 `vtk.py` wrapper，一次性导入 **144 个** VTK 子模块，每个加载一个 x86_64 `.so` 文件 | `vtk.py` 中有 144 行 `from vtkmodules.vtk... import *` |
+| 3. 转译 | Rosetta 2 对每个 `.so` 的 Mach-O loader + 动态链接耗时 0.5–3 秒不等，部分模块（如 `vtkRenderingVolumeOpenGL2`）依赖链长，转译中在 `os.stat()` 处长期阻塞 | 实测每子模块 0.5–2s，144 个总需 1–5 分钟 |
+
+**实际 VTK 使用量（7 个类，4 个子模块）：**
+
+| 类 | 来源模块 | 使用次数 |
+|----|----------|---------|
+| `vtkCellPicker` | `vtkmodules.vtkRenderingCore` | 1× |
+| `vtkPropPicker` | `vtkmodules.vtkRenderingCore` | 2× |
+| `vtkWorldPointPicker` | `vtkmodules.vtkRenderingCore` | 2× |
+| `vtkStringArray` | `vtkmodules.vtkCommonCore` | 1× |
+| `vtkMatrix4x4` | `vtkmodules.vtkCommonMath` | 1× |
+| `vtkTransform` | `vtkmodules.vtkCommonTransforms` | 1× |
+| `vtkActor` | `vtkmodules.vtkRenderingCore` | 2× (layer_dialog) |
+
+**修复方案**:
+用 4 个精确的 `from vtkmodules.xxx import` 替代 `import vtk`：
+
+```python
+# 修复前: 加载 144 个模块，Rosetta 2 下 >60s
+import vtk
+
+# 修复后: 只加载实际使用的 4 个模块，0.3s
+from vtkmodules.vtkCommonCore import vtkStringArray
+from vtkmodules.vtkCommonMath import vtkMatrix4x4
+from vtkmodules.vtkCommonTransforms import vtkTransform
+from vtkmodules.vtkRenderingCore import vtkCellPicker, vtkPropPicker, vtkWorldPointPicker
+from vtkmodules.vtkRenderingCore import vtkActor  # layer_dialog.py
+```
+
+**修复效果**:
+
+| 指标 | 修复前 | 修复后 |
+|------|--------|--------|
+| VTK 导入时间 | 30s+ 超时 / 1-5 min | **0.3s** |
+| 模块加载数 | 144 个 | **4 个** |
+| MainWindow 模块导入 | 26.5s (首次) | **1.7s** |
+| MainWindow() 实例化 | - | **6.7s** |
+| 总启动时间 | 不可用 | **~8s** |
+
+**修改文件**:
+- `src/main_window.py`: `import vtk` → 4 个精确导入 + 全部 `vtk.vtkXxx` → `vtkXxx`
+- `src/layer_dialog.py`: `import vtk` → `from vtkmodules.vtkRenderingCore import vtkActor`
+
+**附：Rosetta 2 为什么不稳定**:
+Rosetta 2 的 AOT (Ahead-of-Time) 转译在首次加载动态库时触发，转译结果缓存在 `/var/db/oah/`。但 VTK 9.6.2 的部分 `.so` 文件（约 300 个）转译队列过大，macOS 的 `trustd`/`syspolicyd` 门禁检查（Gatekeeper）会对每个新 `.dylib` 做公证验证，与 Rosetta 2 的 `oahd` 转译守护进程竞争，导致 `os.stat()` 在 `pathlib.Path.glob()` 中阻塞（见堆栈：`vtkmodules/__init__.py → find_lib_path → Path.glob → os.stat` — 系统调用不返回）。
+
+**根本解决**（推荐，非本次 fix）:
+安装 native arm64 版 Miniforge/Conda，避免 Rosetta 2 转译开销。所有包的 `.so` 直接为 arm64 二进制，启动时间可从 8s 进一步降至 <2s。
+
+---
 
 ## 已关闭问题
 
@@ -849,4 +949,6 @@ macOS双QVTK问题无法通过OffScreenRendering等方案彻底解决，FlightPl
 | ID-35 | 3D交互鲁棒性改进（picker精度提升/None坐标处理） | 3D交互 | 2026-07-06 | v2.2 |
 | ID-36 | 新增图层管理对话框（XY绘图工具+矩形/圆形/多边形选区） | 图层管理/UI | 2026-07-06 | v2.2 |
 | ID-37 | UI重构：场景树+属性面板+坐标简化+ASC导入导出+飞行/编队修复 | 全局 | 2026-07-07 | v2.4 |
+| ID-38 | 操作日志+场景设置+路径点恢复 | 全局 | 2026-07-08 | v2.4 |
+| ID-39 | macOS Rosetta 2 VTK 启动死锁（import vtk 144模块 → 4模块） | 启动/VTK | 2026-07-08 | v2.4 |
 

@@ -29,6 +29,8 @@ class MeasurementTool:
         self.mode = mode
         self._pending.clear()
 
+    on_measurement = None
+
     def add_point(self, world_pos):
         """Feed a 3D point into the current measurement workflow."""
         self._points.append(np.asarray(world_pos))
@@ -78,7 +80,6 @@ class MeasurementTool:
     # ── drawing helpers ────────────────────────
 
     def _draw_distance(self, p1, p2):
-        """Draw a red line + 3D floating distance label."""
         line = pv.Line(p1, p2)
         actor = self._plotter.add_mesh(line, color="red", line_width=3)
         self._actors.append(actor)
@@ -88,17 +89,16 @@ class MeasurementTool:
         label_actor = self._add_3d_label(mid, f"d = {dist:.2f}", color="red")
         self._actors.append(label_actor)
 
-        # Also show endpoints as small spheres → not strictly necessary but
-        # helpful for visual clarity.  Small point sprites are lighter.
         pts = pv.PolyData(np.array([p1, p2]))
         pt_actor = self._plotter.add_points(
             pts, color="red", point_size=8, render_points_as_spheres=True,
         )
         self._actors.append(pt_actor)
 
+        if callable(self.on_measurement):
+            self.on_measurement(f"测距：{dist:.2f} 米")
+
     def _draw_angle(self, p1, p2, p3):
-        """Draw orange lines, vertex sphere, and floating angle label.
-        ``p2`` is the vertex."""
         line1 = pv.Line(p2, p1)
         line2 = pv.Line(p2, p3)
         a1 = self._plotter.add_mesh(line1, color="orange", line_width=3)
@@ -115,12 +115,14 @@ class MeasurementTool:
                                          color="orange")
         self._actors.append(label_actor)
 
-        # Vertex marker
         vtx = pv.PolyData(np.array([p2]))
         v_actor = self._plotter.add_points(
             vtx, color="orange", point_size=10, render_points_as_spheres=True,
         )
         self._actors.append(v_actor)
+
+        if callable(self.on_measurement):
+            self.on_measurement(f"测角：{angle_deg:.1f}°")
 
     def _add_3d_label(self, position, text, color="red"):
         """Create a floating 3D text label at *position*.

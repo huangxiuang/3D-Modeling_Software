@@ -21,7 +21,10 @@ import math
 import time
 import numpy as np
 import pyvista as pv
-import vtk
+from vtkmodules.vtkCommonCore import vtkStringArray
+from vtkmodules.vtkCommonMath import vtkMatrix4x4
+from vtkmodules.vtkCommonTransforms import vtkTransform
+from vtkmodules.vtkRenderingCore import vtkCellPicker, vtkPropPicker, vtkWorldPointPicker
 from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtCore import Qt, QTimer
 import pyvistaqt as pvqt
@@ -43,6 +46,7 @@ from src.config import (
     DEFAULT_CONFIG,
     load_config,
     save_config,
+    COORD_SYSTEMS,
 )
 from src.interaction import InteractionMode
 from src.scene_tree import SceneNodeType, NodeData, SceneTreeFactory
@@ -96,7 +100,6 @@ class ClickablePlotter(pvqt.QtInteractor):
         if event.button() == QtCore.Qt.LeftButton:
             self._press_pos = (event.pos().x(), event.pos().y())
             self._press_time = time.time()
-            print(f"[DEBUG] mousePressEvent: press_pos={self._press_pos}", flush=True)
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event):
@@ -105,7 +108,6 @@ class ClickablePlotter(pvqt.QtInteractor):
             dx = rx - self._press_pos[0]
             dy = ry - self._press_pos[1]
             dt = time.time() - self._press_time
-            print(f"[DEBUG] mouseReleaseEvent: press={self._press_pos} release=({rx},{ry}) delta=({dx},{dy}) dt={dt:.3f}", flush=True)
             if dx * dx + dy * dy < 25 and dt < 0.5:
                 self._process_click(rx, ry)
         self._press_pos = None
@@ -123,38 +125,29 @@ class ClickablePlotter(pvqt.QtInteractor):
         """Convert Qt widget coords → VTK display coords (pixels, bottom-left origin).
 
         Qt origin is top-left, VTK display origin is bottom-left.
-        Must also scale by device pixel ratio for Retina/HiDPI displays.
-        The parent ``QVTKRenderWindowInteractor._setEventInformation`` does the
-        same conversion internally — this must match it exactly.
-
-        QVTK's ``_setEventInformation`` computes::
-
-            vtk_y = round((self.height() - y - 1) * scale)
-
-        whereas an earlier version of this method used ``win_height -
-        round(y*scale) - 1``, which differs by (scale−1) pixels on Retina.
+        VTK's render window reports its size in logical pixels (not Retina-physical),
+        so we pass logical pixel coordinates directly — no devicePixelRatio scaling.
         """
-        scale = QtWidgets.QApplication.instance().devicePixelRatio()
-        vtk_x = int(round(qt_x * scale))
-        vtk_y = int(round((self.height() - qt_y - 1) * scale))
+        vtk_x = qt_x
+        vtk_y = self.height() - qt_y - 1
         return vtk_x, vtk_y
 
     def _process_click(self, x, y):
         if self.click_callback is None:
             return
         vtk_x, vtk_y = self._to_vtk_display(x, y)
-        picker = vtk.vtkCellPicker()
+        picker = vtkCellPicker()
         picker.SetTolerance(0.001)
         if picker.Pick(vtk_x, vtk_y, 0, self.renderer) and picker.GetCellId() >= 0:
             world = np.array(picker.GetPickPosition())
             actor = picker.GetActor()
         else:
-            pp = vtk.vtkPropPicker()
+            pp = vtkPropPicker()
             if pp.Pick(vtk_x, vtk_y, 0, self.renderer):
                 world = np.array(pp.GetPickPosition())
                 actor = pp.GetActor()
             else:
-                wp = vtk.vtkWorldPointPicker()
+                wp = vtkWorldPointPicker()
                 wp.Pick(vtk_x, vtk_y, 0, self.renderer)
                 world = np.array(wp.GetPickPosition())
                 actor = None
@@ -252,6 +245,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._flight_window = None
 
+        # Transform log throttle (single-shot timer, resets on each slider move)
+        self._pending_transform_log = None
+        self._transform_log_timer = QTimer(self)
+        self._transform_log_timer.setSingleShot(True)
+        self._transform_log_timer.timeout.connect(self._flush_transform_log)
+
         # Formation flight (ID-27)
         self._formation_mode = False
         self._formation_aircraft = []   # [name, ...]  first = leader, rest = followers
@@ -278,6 +277,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._setup_toolbar()
         self._setup_docks()
         self._refresh_ui()
+
+        self.meas_tool.on_measurement = self._on_measurement_log
 
         # ── Wire interaction callbacks on the plotter ──
         self.plotter.click_callback = self._on_3d_click
@@ -370,7 +371,7 @@ class MainWindow(QtWidgets.QMainWindow):
             fd = mesh.GetFieldData()
             arr = fd.GetAbstractArray("__scene_name__")
             if arr is None:
-                arr = vtk.vtkStringArray()
+                arr = vtkStringArray()
                 arr.SetName("__scene_name__")
                 fd.AddArray(arr)
             if arr.GetNumberOfValues() > 0:
@@ -415,7 +416,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _get_name_from_pick(self, x, y):
         """Return the scene-object *name* at screen coordinates, or ``None``."""
-        picker = vtk.vtkPropPicker()
+        picker = vtkPropPicker()
         vtk_x, vtk_y = self.plotter._to_vtk_display(x, y)
         if not picker.Pick(vtk_x, vtk_y, 0, self.plotter.renderer):
             return None
@@ -447,6 +448,8 @@ class MainWindow(QtWidgets.QMainWindow):
         fm.addAction("导出 ASC 格网数据...", self._export_asc_grid)
         fm.addSeparator()
         fm.addAction("导出选中模型...", self._export_selected)
+        fm.addSeparator()
+        fm.addAction("导出操作日志...", self._export_log)
         fm.addSeparator()
         fm.addAction("退出", self.close)
 
@@ -645,14 +648,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.addDockWidget(Qt.BottomDockWidgetArea, self._timeline_dock)
         self._timeline_dock.raise_()
 
-        # ── Bottom: 坐标信息 ──
-        dock_info = QtWidgets.QDockWidget("坐标信息", self)
+        # ── Bottom: 操作日志 (左) + 坐标信息 (右) ──
+        dock_bottom = QtWidgets.QDockWidget("操作日志 & 坐标信息", self)
+        bottom_widget = QtWidgets.QWidget()
+        bottom_layout = QtWidgets.QHBoxLayout(bottom_widget)
+        bottom_layout.setContentsMargins(4, 2, 4, 2)
+
+        self._log_text = QtWidgets.QTextEdit()
+        self._log_text.setReadOnly(True)
+        self._log_text.setMaximumHeight(150)
+        self._log_text.setFont(QtGui.QFont("Menlo", 9))
+        bottom_layout.addWidget(self._log_text, 2)
+
         self._info_text = QtWidgets.QTextEdit()
         self._info_text.setReadOnly(True)
         self._info_text.setMaximumHeight(150)
         self._info_text.setFont(QtGui.QFont("Menlo", 10))
-        dock_info.setWidget(self._info_text)
-        self.addDockWidget(Qt.BottomDockWidgetArea, dock_info)
+        self._info_text.setMaximumWidth(400)
+        bottom_layout.addWidget(self._info_text, 1)
+
+        dock_bottom.setWidget(bottom_widget)
+        self.addDockWidget(Qt.BottomDockWidgetArea, dock_bottom)
 
     def _create_shared_widgets(self):
         self._obj_combo = QtWidgets.QComboBox()
@@ -694,7 +710,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._prop_pages[""] = blank
 
         pages = [
-            (SceneNodeType.SCENE_SETTINGS, self._build_settings_property_page),
             (SceneNodeType.AIRCRAFT, self._build_aircraft_property_page),
             (SceneNodeType.WAYPOINT, self._build_waypoint_property_page),
             (SceneNodeType.ANIMATION_TASK, self._build_animation_property_page),
@@ -703,17 +718,6 @@ class MainWindow(QtWidgets.QMainWindow):
             page = builder()
             self._property_stack.addWidget(page)
             self._prop_pages[node_type] = page
-
-    def _build_settings_property_page(self):
-        page = QtWidgets.QWidget()
-        lo = QtWidgets.QVBoxLayout(page)
-        lo.setSpacing(6)
-        lo.addWidget(QtWidgets.QLabel("场景设置"))
-        btn_cam = QtWidgets.QPushButton("相机复位")
-        btn_cam.clicked.connect(self._reset_camera)
-        lo.addWidget(btn_cam)
-        lo.addStretch()
-        return page
 
     def _build_aircraft_property_page(self):
         page = QtWidgets.QWidget()
@@ -782,6 +786,8 @@ class MainWindow(QtWidgets.QMainWindow):
         data = item.data(0, Qt.UserRole)
         if data is None:
             return
+        if data.node_type == SceneNodeType.SCENE_SETTINGS:
+            return
         page = self._prop_pages.get(data.node_type)
         if page is not None:
             self._property_stack.setCurrentWidget(page)
@@ -830,9 +836,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _route_slot_action(self, data):
         slot = data.slot_name
-        if slot == "_on_wp_button":
-            self._set_interaction_mode(InteractionMode.WAYPOINT)
-        elif slot == "_on_formation_toggled":
+        if slot == "_on_formation_toggled":
             self._on_formation_toggled(not self._formation_mode)
             page = self._prop_pages.get(SceneNodeType.ANIMATION_TASK)
             if page is not None:
@@ -846,6 +850,13 @@ class MainWindow(QtWidgets.QMainWindow):
             method = getattr(self, slot, None)
             if method and callable(method):
                 method()
+
+    def _open_scene_settings_dialog(self):
+        dlg = SceneSettingsDialog(self)
+        dlg.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        dlg.destroyed.connect(lambda: setattr(self, '_scene_settings_dialog', None))
+        dlg.show()
+        self._scene_settings_dialog = dlg
 
     def _on_tree_item_expanded(self, item):
         data = item.data(0, Qt.UserRole)
@@ -952,6 +963,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._add_actor(new_name, self.scene_objects[new_name])
         self._insert_aircraft_node(new_name)
         self._refresh_ui()
+        self._log_action(f"用户增加了飞机: {new_name}")
         self.statusBar().showMessage("已添加新飞机: {}".format(new_name), 3000)
 
     def _insert_aircraft_node(self, name):
@@ -977,6 +989,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scene_objects.pop(name, None)
         self._obj_transforms.pop(name, None)
         self._aircraft_waypoints.pop(name, None)
+        self._log_action(f"用户删除了飞机: {name}")
 
     def _delete_waypoint(self, ac_name, wp_idx):
         if wp_idx is None:
@@ -985,6 +998,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if 0 <= wp_idx < len(waypoints):
             waypoints.pop(wp_idx)
         self._rebuild_waypoint_actors()
+        self._log_action(f"用户删除了路径点 #{wp_idx + 1}")
 
     def _rebuild_waypoint_actors(self):
         for a in self._wp_actors:
@@ -1196,7 +1210,6 @@ class MainWindow(QtWidgets.QMainWindow):
     # ── Terrain layer controls (ID-18) ─────────────
 
     def _toggle_terrain_layer(self, name, visible):
-        """Show / hide a terrain layer actor."""
         info = self.scene_objects.get(name)
         if info is None:
             return
@@ -1206,6 +1219,8 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self._remove_actor(name)
         self.plotter.render()
+        action_label = "显示" if visible else "隐藏"
+        self._log_action(f"用户{action_label}了图层：{name}")
 
     def _toggle_layer(self, name, visible):
         """Show / hide a built-in scene object (tree, bird, …)."""
@@ -1236,17 +1251,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plotter.render()
 
     def _on_terrain_opacity(self, name, value):
-        """Update a terrain layer's opacity and persist to scene_objects params."""
         if name not in self.plotter_actors:
             return
         actor = self.plotter_actors[name]
         vtk_actor = self._resolve_vtk_actor(actor)
         vtk_actor.GetProperty().SetOpacity(value)
-        # Persist so rebuilds (toggle off/on) keep the user's setting
         info = self.scene_objects.get(name)
         if info is not None:
             info["params"]["opacity"] = value
         self.plotter.render()
+        self._log_action(f"用户调整了图层 [{name}] 不透明度为 {value:.2f}")
 
     def _refresh_terrain_ui(self):
         """Sync terrain layer checkboxes & sliders with current scene state."""
@@ -1388,11 +1402,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         is_dem = self._is_dem_scene()
         extent = self._compute_terrain_extent()
+        terrain_mesh = self.scene_objects.get("terrain", {}).get("mesh")
         dlg = LayerManagementDialog(
             self,
             layer_names=dict(self._terrain_layer_names),
             terrain_extent=extent,
             is_dem_scene=is_dem,
+            terrain_mesh=terrain_mesh,
         )
         if dlg.exec_() != QtWidgets.QDialog.Accepted:
             return
@@ -1452,6 +1468,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._terrain_chks.pop(name, None)
         self._terrain_opacity_setters.pop(name, None)
         self.plotter.render()
+        self._log_action(f"用户移除了图层掩膜：{name}")
 
     _CLIP_LAYER_PARAMS = {
         "layer_sand":  {"color": "#e8c76a", "smooth_shading": True, "opacity": 1.0},
@@ -1533,6 +1550,8 @@ class MainWindow(QtWidgets.QMainWindow):
             }
             self._add_actor(clip_name, self.scene_objects[clip_name])
             self.scene_objects[clip_name]["visible"] = True
+            layer_label = self._terrain_layer_names.get(layer_key, layer_key)
+            self._log_action(f"用户在场景中应用了【{layer_label}】图层掩膜")
 
     def _refresh_ui(self):
         """Refresh flight combo, terrain UI, scene-object and tree."""
@@ -1652,6 +1671,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # moment the object is selected, not only after a slider move (ID-6).
         self._apply_obj_transform_to_actor(clean_name)
 
+        clean = clean_name.replace("[自定义] ", "")
+        t = self._obj_transforms.get(clean_name)
+        if t:
+            self._log_action(f"用户选中了对象【{clean_name}】，位置 ({t['offset'][0]:.1f}, {t['offset'][1]:.1f}, {t['offset'][2]:.1f})")
+
     def _set_slider_value(self, slider_widget, val):
         s = slider_widget.findChild(QtWidgets.QSlider)
         if s is None:
@@ -1731,15 +1755,32 @@ class MainWindow(QtWidgets.QMainWindow):
         H[:3, 3] = offset - (R * s) @ orig_center
 
         # --- write into VTK matrix and set as UserTransform ---
-        vtk_matrix = vtk.vtkMatrix4x4()
+        vtk_matrix = vtkMatrix4x4()
         for i in range(4):
             for j in range(4):
                 vtk_matrix.SetElement(i, j, float(H[i, j]))
 
-        transform = vtk.vtkTransform()
+        transform = vtkTransform()
         transform.SetMatrix(vtk_matrix)
         vtk_actor.SetUserTransform(transform)
         self.plotter.render()
+
+    def _schedule_transform_log(self, clean):
+        self._pending_transform_log = clean
+        self._transform_log_timer.start(1500)
+
+    def _flush_transform_log(self):
+        if self._pending_transform_log is None:
+            return
+        name = self._pending_transform_log
+        self._pending_transform_log = None
+        t = self._obj_transforms.get(name)
+        if t is None:
+            return
+        offset = t["offset"]
+        self._log_action(
+            f"用户调整了【{name}】位置 ({offset[0]:.2f}, {offset[1]:.2f}, {offset[2]:.2f})"
+        )
 
     def _on_obj_pos_x(self, val):
         name = self._obj_combo.currentText()
@@ -1748,6 +1789,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._obj_transforms[clean]["offset"][0] = val
         self._apply_obj_transform_to_actor(clean)
+        self._schedule_transform_log(clean)
 
     def _on_obj_pos_y(self, val):
         name = self._obj_combo.currentText()
@@ -1756,6 +1798,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._obj_transforms[clean]["offset"][1] = val
         self._apply_obj_transform_to_actor(clean)
+        self._schedule_transform_log(clean)
 
     def _on_obj_pos_z(self, val):
         name = self._obj_combo.currentText()
@@ -1764,6 +1807,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._obj_transforms[clean]["offset"][2] = val
         self._apply_obj_transform_to_actor(clean)
+        self._schedule_transform_log(clean)
 
     def _on_obj_scale(self, val):
         name = self._obj_combo.currentText()
@@ -1826,7 +1870,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_3d_move(self, x, y):
         """Update coordinate info on mouse move."""
-        picker = vtk.vtkWorldPointPicker()
+        picker = vtkWorldPointPicker()
         vtk_x, vtk_y = self.plotter._to_vtk_display(x, y)
         picker.Pick(vtk_x, vtk_y, 0, self.plotter.renderer)
         world = np.array(picker.GetPickPosition())
@@ -1843,8 +1887,14 @@ class MainWindow(QtWidgets.QMainWindow):
         for btn, btn_mode in self._mode_buttons:
             btn.setChecked(btn_mode == mode and mode != InteractionMode.NORMAL)
 
+        # Waypoint placement mode
+        if mode == InteractionMode.WAYPOINT:
+            self.setCursor(QtGui.QCursor(Qt.CrossCursor))
+            self.statusBar().showMessage(
+                "路径点模式 — 点击 3D 场景放置路径点  |  再次点击\"添加3D路径点\"退出", 0
+            )
         # Measurement mode internal
-        if mode in (InteractionMode.MEASURE_DISTANCE, InteractionMode.MEASURE_ANGLE):
+        elif mode in (InteractionMode.MEASURE_DISTANCE, InteractionMode.MEASURE_ANGLE):
             self.meas_tool.set_mode(
                 "distance" if mode == InteractionMode.MEASURE_DISTANCE else "angle"
             )
@@ -1852,22 +1902,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(
                 "测量模式 — 点击 3D 场景放置测量点", 5000
             )
-        elif mode == InteractionMode.WAYPOINT:
-            self.setCursor(QtGui.QCursor(Qt.CrossCursor))
-            self.statusBar().showMessage(
-                "路径点模式 — 点击 3D 场景添加路径点", 5000
-            )
         else:
             self.setCursor(QtGui.QCursor(Qt.ArrowCursor))
             self.statusBar().showMessage(
                 "就绪  |  左键旋转 · 滚轮缩放 · 中键平移", 5000
             )
-
-    def _on_wp_button(self, checked):
-        """Bridge from waypoint button to mode switch."""
-        self._set_interaction_mode(
-            InteractionMode.WAYPOINT if checked else InteractionMode.NORMAL
-        )
 
 
     # ═══════════════════════════════════════════════════════════════
@@ -1890,9 +1929,11 @@ class MainWindow(QtWidgets.QMainWindow):
             p.camera_position = views[direction]
             p.camera.focal_point = fp
             p.render()
+        view_names = {"top": "俯视图", "bottom": "仰视图", "front": "正视图", "side": "侧视图"}
+        self._log_action(f"用户切换了相机视角，当前为：{view_names.get(direction, direction)}")
+        
 
     def _reset_camera(self):
-        """Reset only the camera to default position (ID-7)."""
         p = self.plotter
         extent = self._compute_terrain_extent()
         xy_half, z_half = extent
@@ -1902,6 +1943,8 @@ class MainWindow(QtWidgets.QMainWindow):
                              (0, 0, mid_z), (0, 0, 1)]
         p.camera.focal_point = (0, 0, mid_z)
         p.render()
+        self._log_action("用户复位了相机")
+        
 
     def _focus_camera_on_aircraft(self, pos, yaw_deg=0.0):
         """Position camera in tail-chase view behind and above the aircraft."""
@@ -1919,7 +1962,6 @@ class MainWindow(QtWidgets.QMainWindow):
         p.render()
 
     def _reset_all(self):
-        """Reset all objects to their initial transforms and reset camera (ID-7)."""
         for name in list(self._obj_transforms.keys()):
             center = self._compute_obj_center(name)
             self._obj_transforms[name] = {
@@ -1933,6 +1975,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._apply_obj_transform_to_actor(name)
         self._refresh_obj_combo()
         self._reset_camera()
+        self._log_action("用户点击了全局复位")
 
     # ═══════════════════════════════════════════════════════════════
     #  File I/O
@@ -1981,6 +2024,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_obj_combo()
         self.plotter.render()
         self.statusBar().showMessage(f"场景已加载: {path}", 3000)
+        
 
     # ── Data save / load (aircraft + terrain, separate JSONs) ──
 
@@ -2062,6 +2106,7 @@ class MainWindow(QtWidgets.QMainWindow):
         with open(terrain_path, "w") as f:
             json.dump(terrain_data, f, indent=2, ensure_ascii=False)
 
+        self._log_action(f"用户保存了数据：{name}")
         self.statusBar().showMessage(
             f"数据已保存: {name} (飞行器 → {aircraft_path}, 地形 → {terrain_path})",
             5000,
@@ -2128,6 +2173,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_flight_combo()
         self._on_obj_select_changed(self._obj_combo.currentIndex())
         self.plotter.render()
+        self._log_action(f"用户加载了飞机数据：{base_name}")
         self.statusBar().showMessage(f"飞行器数据已载入: {base_name}", 5000)
 
     def _load_terrain_data(self, path, base_name):
@@ -2195,6 +2241,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._refresh_obj_combo()
         self.plotter.render()
+        self._log_action(f"用户加载了地形数据：{base_name}")
         self.statusBar().showMessage(f"场景数据已载入 (excl. aircraft): {base_name}", 5000)
 
     # ── Screenshot ─────────────────────────────────
@@ -2375,6 +2422,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if reply != QtWidgets.QMessageBox.Yes:
             return
 
+        # ── Persist user choices ──────────────────────────
+        self.config["elevation_scale"] = vert_exag
+        crs = dem.get("crs")
+        if crs:
+            self.config["dem_crs"] = crs
+
         # ── Build DEM scene objects ──────────────────────
         dem_scene = build_dem_scene(
             dem,
@@ -2422,11 +2475,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ── Refresh UI ───────────────────────────────────
         self._refresh_ui()
+        x_span = abs(dem['x'][-1] - dem['x'][0])
+        y_span = abs(dem['y'][-1] - dem['y'][0])
+        self._log_action(f"用户加载了新的 DEM 地形，尺寸：X={x_span:,.0f}m, Y={y_span:,.0f}m")
         self.statusBar().showMessage(
             f"DEM 已导入: {os.path.basename(path)}  "
             f"({dem['rows']}×{dem['cols']}, "
             f"Z {dem['z'].min():.0f}~{dem['z'].max():.0f}m)", 8000
         )
+        
 
     # ═══════════════════════════════════════════════════════════════
     #  ASC grid import/export
@@ -2497,11 +2554,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plotter.reset_camera()
         self.plotter.render()
         self._refresh_ui()
+        self._log_action("用户导入了 ASC 格网数据")
         self.statusBar().showMessage(
             f"ASC 格网已导入: {os.path.basename(path)}  "
             f"({dem['rows']}×{dem['cols']}, "
             f"Z {dem['z'].min():.0f}~{dem['z'].max():.0f})", 8000
         )
+        
 
     def _parse_asc(self, path):
         with open(path) as f:
@@ -2654,10 +2713,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self._wp_actors.append(label_actor)
 
         self.plotter.render()
+        self._log_action(
+            f"用户添加了路径点 #{idx}: ({world_pos[0]:.2f}, {world_pos[1]:.2f}, {world_pos[2]:.2f})")
         self.statusBar().showMessage(
             f"路径点 #{idx}:  {world_pos[0]:.2f}, {world_pos[1]:.2f}, {world_pos[2]:.2f}",
             3000,
         )
+
+    def _toggle_wp_mode(self):
+        """Toggle between WAYPOINT (click-to-place) and NORMAL mode."""
+        if self._current_mode == InteractionMode.WAYPOINT:
+            self._set_interaction_mode(InteractionMode.NORMAL)
+        else:
+            self._set_interaction_mode(InteractionMode.WAYPOINT)
 
     def _snap_to_terrain(self, world_pos):
         """Return (x, y, terrain_z) by sampling the terrain mesh Z at (x, y)."""
@@ -2700,7 +2768,9 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
         extent = self._compute_terrain_extent()
-        dlg = WaypointPreciseDialog(self, terrain_extent=extent)
+        terrain_mesh = self.scene_objects.get("terrain", {}).get("mesh")
+        self._log_action("用户打开了精准添加路径点对话框")
+        dlg = WaypointPreciseDialog(self, terrain_extent=extent, terrain_mesh=terrain_mesh)
         if dlg.exec_() == QtWidgets.QDialog.Accepted:
             coords_list = dlg.get_coords()
             for xyz in coords_list:
@@ -2715,6 +2785,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.plotter.remove_actor(self._path_actor)
             self._path_actor = None
         self.plotter.render()
+        self._log_action("用户清除了当前所有飞行路径点")
 
     # ═══════════════════════════════════════════════════════════════
     #  Flight animation (ID-11)
@@ -2736,11 +2807,12 @@ class MainWindow(QtWidgets.QMainWindow):
     # ── Formation flight (ID-27) ──────────────────────────
 
     def _on_formation_toggled(self, checked):
-        """Show/hide the formation aircraft list when toggle button is clicked."""
         self._formation_mode = checked
         self._formation_list.setVisible(checked)
         if checked:
             self._refresh_formation_list()
+        state = "开启" if checked else "关闭"
+        self._log_action(f"用户{state}了编队飞行模式")
 
     def _refresh_formation_list(self):
         """Populate the formation list with checkable aircraft items."""
@@ -2959,13 +3031,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         count = len(selected)
         label = f"编队 {count}机" if count > 1 else name
+        self._log_action(f"用户开始了飞行 ({label})")
         self.statusBar().showMessage(
             f"飞行开始: {label} → {len(aircraft_wps)} 个路径点 ({total_time_ms/1000:.1f}s)", 3000
         )
         self._flight_timer.start(self.FLIGHT_INTERVAL_MS)
 
     def _stop_flight(self):
-        """Stop the current flight animation."""
         self._flight_timer.stop()
         self._flight_active = False
         self._flight_segment_idx = 0
@@ -2976,6 +3048,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_formation.setEnabled(True)
         self._btn_save_flight.setEnabled(True)
         self._btn_load_flight.setEnabled(True)
+        self._log_action("用户停止了飞行")
 
     # ────────────────────────────────────────────────────────────────
     #  ID-14: Smooth flight path & attitude
@@ -3232,10 +3305,10 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception as e:
                 print(f"Failed to generate 3D plot: {e}")
 
+        self._log_action(f"用户保存了飞行数据：{os.path.basename(name)}")
         self.statusBar().showMessage(f"飞行数据已保存: {name}", 3000)
 
     def _load_flight_data(self):
-        """Load a flight data JSON and replay the animation."""
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "载入飞行数据",
             self._ensure_flight_dir(),
@@ -3243,6 +3316,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if not path:
             return
+        self._loaded_flight_path = path
 
         try:
             with open(path) as f:
@@ -3337,6 +3411,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ft["yaw"] = 0.0
             self._apply_obj_transform_to_actor(fname)
 
+        self._log_action(f"用户加载了路径规划文件：{os.path.basename(self._loaded_flight_path)}")
         self.statusBar().showMessage(
             f"载入飞行数据: {name}" + (f" (编队 {len(formation)}机)" if len(formation) > 1 else "") + f" ({len(segments)} 个段)", 3000
         )
@@ -3460,6 +3535,7 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             msg = "✅ 未检测到碰撞（基于包围盒 AABB）"
 
+        self._log_action("用户执行了碰撞检测")
         QtWidgets.QMessageBox.information(self, "碰撞检测", msg)
 
 
@@ -3504,6 +3580,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.selected_name = name
         self.plotter.render()
         self._update_info()
+        self._log_action(f"用户选中了对象：{name}")
 
     def _clear_highlight(self):
         """Restore any previously highlighted actor's original properties."""
@@ -3530,6 +3607,29 @@ class MainWindow(QtWidgets.QMainWindow):
     # ═══════════════════════════════════════════════════════════════
     #  Coordinate info display
     # ═══════════════════════════════════════════════════════════════
+
+    def _log_action(self, msg):
+        import datetime
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        self._log_text.append(f"[{ts}] {msg}")
+        sb = self._log_text.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _export_log(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "导出操作日志", "operation.log", "LOG (*.log *.txt)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self._log_text.toPlainText())
+            self.statusBar().showMessage(f"操作日志已导出: {path}", 3000)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "导出失败", f"导出日志时出错:\n{e}")
+
+    def _on_measurement_log(self, text):
+        self._log_action(f"用户使用了测量工具，{text}")
 
     def _update_info(self, mouse_world=None):
         lines = [""]
@@ -3605,33 +3705,99 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
 
     def _show_about(self):
-        QtWidgets.QMessageBox.about(
-            self,
-            "关于 3DSceneSoftware",
-            "<h3>3DSceneSoftware v2.0</h3>"
-            "<p>基于 PyQt5 + PyVista (VTK 引擎)</p>"
-            "<p>可视化 3D 大场景 + 目标建模</p>"
-            "<hr>"
-            "<p><b>功能:</b></p>"
-            "<ul>"
-            "<li>场景渲染 · 视角控制 · 图层管理</li>"
-            "<li>参数调节 · 3D 元素选择 · 坐标显示</li>"
-            "<li>测量工具 (距离/角度) · 碰撞检测</li>"
-            "<li>路径规划 (点选 + 坐标输入 + 样条曲线)</li>"
-            "<li>场景保存/加载 · 截图/连续录制</li>"
-            "<li>模型导入 (STL/OBJ) / 导出</li>"
-            "<li>对象变换 (位置/缩放) · 坐标系切换</li>"
-            "<li>多对象场景 (地形/河流/植被/飞行器/鸟/树)</li>"
-            "</ul>",
-        )
+        dlg = AboutDialog(self)
+        dlg.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        dlg.show()
 
+
+
+class AboutDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("关于 3DSceneSoftware")
+        self.setWindowFlags(self.windowFlags() | QtCore.Qt.Window)
+        self.resize(500, 600)
+
+        lo = QtWidgets.QVBoxLayout(self)
+        lo.setSpacing(8)
+
+        title = QtWidgets.QLabel("3DSceneSoftware v2.4")
+        title.setStyleSheet("font-size: 20px; font-weight: bold; color: #1a1a2e;")
+        lo.addWidget(title)
+
+        subtitle = QtWidgets.QLabel("基于 PyQt5 + PyVista (VTK 引擎) | 可视化 3D 大场景建模平台")
+        subtitle.setStyleSheet("font-size: 12px; color: #666;")
+        lo.addWidget(subtitle)
+        lo.addSpacing(10)
+
+        notes = QtWidgets.QTextEdit()
+        notes.setReadOnly(True)
+        notes.setStyleSheet("font-family: Menlo, monospace; font-size: 11px;")
+        notes.setHtml("""
+<h3>Release Notes</h3>
+<hr>
+<h4>v2.4 — 2026-07-08</h4>
+<ul>
+<li><b>修复:</b> macOS Apple Silicon + Rosetta 2 环境下 VTK 启动死锁 — 用 4 个精确导入替代 <code>import vtk</code>（144 个 x86_64 .so 模块），启动时间从 30s+（超时）降至 ~8s</li>
+<li><b>修复:</b> Retina 屏鼠标拾取偏移 — <code>_to_vtk_display()</code> 去掉 devicePixelRatio 倍乘，VTK render window 报告逻辑像素，提逻辑坐标即可</li>
+<li><b>新增:</b> 场景信息独立窗口（双击场景设置 → 场景信息）— 自动刷新坐标系/地形尺寸/Z偏移/垂直夸张/相机视角</li>
+<li><b>新增:</b> 操作日志导出（文件 → 导出操作日志... → .log 文件）</li>
+<li><b>恢复:</b> 添加3D路径点（单击场景）— 路径规划树节点支持单击 scene 放置路径点</li>
+<li><b>恢复:</b> 路径规划 WaypointPreciseDialog + LayerManagementDialog 等高线支持</li>
+<li><b>修复:</b> DEM 导入后垂直夸张系数正确保存到 config，场景信息实时显示</li>
+<li><b>修复:</b> 坐标系从硬编码 "WGS84 (经纬度)" 改为动态读取 config (ENU + DEM CRS)</li>
+</ul>
+
+<h4>v2.3 — 2026-07-07</h4>
+<ul>
+<li>UI 重构：场景树 + 属性面板 QStackedWidget + 坐标简化</li>
+<li>ASC 格网导入/导出 (ESRI ASCII Grid 格式)</li>
+<li>飞行按钮修复 / 编队僚机重叠修复</li>
+<li>删除坐标系切换 (ENU/FLU/NED/NWU)</li>
+</ul>
+
+<h4>v2.2 — 2026-07-06</h4>
+<ul>
+<li>图层管理对话框 (XY 绘图工具 + 矩形/圆形/多边形选区)</li>
+<li>3D 交互鲁棒性改进 (picker 精度提升)</li>
+<li>DEM 保存/载入修复 (X,Y 网格完整重构)</li>
+<li>DEM 相机视图动态范围 / 飞机缩放到 2000×</li>
+<li>删除 STL/OBJ 导入</li>
+</ul>
+
+<h4>v2.1 — 2026-07-06</h4>
+<ul>
+<li>鼠标坐标精度修复 (Retina 屏幕 1px 偏差)</li>
+<li>图层管理移至菜单 / Z 夸张选项 / 飞机默认高度 7000m</li>
+<li>精准路径点 XY 自动范围</li>
+</ul>
+
+<h4>v2.0 — 2026-07-06</h4>
+<ul>
+<li>PyVista extract_surface() 崩溃修复</li>
+</ul>
+
+<h4>v1.x — 2026-06-29 ~ 2026-07-03</h4>
+<ul>
+<li>飞机姿态控制 (Yaw/Pitch/Roll 局部旋转)</li>
+<li>路径点动态飞行 (Catmull-Rom 样条 + 速度模型)</li>
+<li>时间轴 / 编队飞行 / DEM 图层管理</li>
+<li>保存/载入 JSON 数据 / 测量工具 / 碰撞检测</li>
+<li>FlightWindow 独立窗口 (macOS 双 QVTK 已废弃)</li>
+</ul>
+""")
+        lo.addWidget(notes)
+
+        btn_close = QtWidgets.QPushButton("关闭")
+        btn_close.clicked.connect(self.close)
+        lo.addWidget(btn_close)
 
 
 
 class WaypointPreciseDialog(QtWidgets.QDialog):
     """Precise waypoint dialog with terrain-extent-aware XY/Z ranges."""
 
-    def __init__(self, parent=None, terrain_extent=None):
+    def __init__(self, parent=None, terrain_extent=None, terrain_mesh=None):
         """*terrain_extent* = ``(xy_half, z_half)`` or ``None`` for defaults."""
         super().__init__(parent)
         self.setWindowTitle("精准添加路径点")
@@ -3645,6 +3811,7 @@ class WaypointPreciseDialog(QtWidgets.QDialog):
         self._xy_limit = xy_half * 1.2
         self._z_limit = z_half * 1.5
         self._spin_xy_range = xy_half * 2.0
+        self._terrain_mesh = terrain_mesh
 
         self._points = []
         self._z_values = []
@@ -3782,6 +3949,31 @@ class WaypointPreciseDialog(QtWidgets.QDialog):
 
         return widget
 
+    def _draw_contours(self, ax):
+        mesh = self._terrain_mesh
+        if mesh is None:
+            return
+        try:
+            surface = mesh.extract_surface()
+            pts = np.asarray(surface.points)
+            if len(pts) < 50:
+                return
+            if len(pts) > 10000:
+                step = max(1, len(pts) // 8000)
+                pts = pts[::step]
+            import matplotlib.tri as tri
+            triang = tri.Triangulation(pts[:, 0], pts[:, 1])
+            z = pts[:, 2]
+            z_min, z_max = z.min(), z.max()
+            if z_max - z_min < 1.0:
+                return
+            n_levels = 8 if len(pts) > 3000 else 12
+            levels = np.linspace(z_min, z_max, n_levels)
+            ax.tricontour(triang, z, levels=levels,
+                          colors="gray", linewidths=0.4, alpha=0.4)
+        except Exception:
+            pass
+
     def _redraw_xy(self):
         self._ax_xy.clear()
         self._ax_xy.set_xlim(-self._xy_limit, self._xy_limit)
@@ -3792,6 +3984,7 @@ class WaypointPreciseDialog(QtWidgets.QDialog):
         self._ax_xy.set_ylabel("Y")
         self._ax_xy.axhline(0, color="gray", linewidth=0.5)
         self._ax_xy.axvline(0, color="gray", linewidth=0.5)
+        self._draw_contours(self._ax_xy)
 
         if self._points:
             pts = np.array(self._points)
@@ -3999,3 +4192,100 @@ class WaypointPreciseDialog(QtWidgets.QDialog):
             z = self._z_values[i] if i < len(self._z_values) else 0.0
             result.append([x, y, z])
         return result
+
+
+class SceneSettingsDialog(QtWidgets.QDialog):
+    def __init__(self, main_window, parent=None):
+        super().__init__(parent)
+        self.mw = main_window
+        self.setWindowTitle("场景设置")
+        self.setWindowFlags(self.windowFlags() | QtCore.Qt.Window)
+        self.resize(420, 520)
+
+        lo = QtWidgets.QVBoxLayout(self)
+        lo.setSpacing(10)
+
+        self._labels = {}
+        fields = [
+            ("作者", "Eric"),
+            ("日期", ""),
+            ("坐标系", ""),
+            ("当前地形尺寸", ""),
+            ("Z 轴基准偏移", ""),
+            ("边界锁定范围", ""),
+            ("地形垂直夸张系数", ""),
+            ("默认相机视角", ""),
+        ]
+        for label, default in fields:
+            lo.addWidget(QtWidgets.QLabel(label))
+            val = QtWidgets.QLabel(default)
+            val.setStyleSheet("font-size: 15px; font-weight: bold; color: #2a66b0; "
+                              "padding: 4px 8px; background: #f5f5f5; border-radius: 4px;")
+            val.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            lo.addWidget(val)
+            self._labels[label] = val
+
+        lo.addStretch()
+
+        self._refresh_lock = False  # guard against concurrent refreshes
+        # Defer first refresh to avoid VTK/OpenGL stalls during dialog construction
+        self._timer = QtCore.QTimer(self)
+        self._timer.timeout.connect(self._refresh)
+        self._timer.start(1000)
+        QtCore.QTimer.singleShot(0, self._refresh)
+
+    def _refresh(self) -> None:
+        """Refresh all labels — called on init (deferred) and every 1 s."""
+        if self._refresh_lock:
+            return
+        self._refresh_lock = True
+        mw = self.mw
+        now = QtCore.QDate.currentDate().toString("yyyy-MM-dd")
+        self._labels["日期"].setText(now)
+        self._labels["作者"].setText("Eric")
+        cs = mw.config.get("coordinate_system", "ENU")
+        dem_crs = mw.config.get("dem_crs", "")
+        cs_info = COORD_SYSTEMS.get(cs, {})
+        cs_label = cs_info.get("label", cs)
+        if dem_crs:
+            self._labels["坐标系"].setText(f"{dem_crs}  ({cs_label})")
+        else:
+            self._labels["坐标系"].setText(f"{cs_label}")
+        info = mw.scene_objects.get("terrain")
+        if info is not None:
+            try:
+                b = info["mesh"].bounds
+                x_span = abs(b[1] - b[0])
+                y_span = abs(b[3] - b[2])
+                self._labels["当前地形尺寸"].setText(
+                    f"X: {x_span:,.1f} 米,  Y: {y_span:,.1f} 米")
+                self._labels["Z 轴基准偏移"].setText("海平面 0 米")
+                self._labels["边界锁定范围"].setText(
+                    f"X [{b[0]:,.1f}, {b[1]:,.1f}]\n"
+                    f"Y [{b[2]:,.1f}, {b[3]:,.1f}]\n"
+                    f"Z [{b[4]:,.1f}, {b[5]:,.1f}]")
+            except Exception:
+                pass
+        ve = mw.config.get("elevation_scale", 1.0)
+        self._labels["地形垂直夸张系数"].setText(f"{ve:.1f}")
+        try:
+            cam = mw.plotter.camera
+            pos = cam.GetPosition()
+            fp = cam.GetFocalPoint()
+            dx, dy, dz = pos[0]-fp[0], pos[1]-fp[1], pos[2]-fp[2]
+            if abs(dx) < 1 and abs(dz) < 1 and dy < 0:
+                view = "俯视 (Top)"
+            elif abs(dx) < 1 and abs(dz) < 1 and dy > 0:
+                view = "仰视 (Bottom)"
+            elif abs(dy) < 1 and abs(dz) < 1:
+                view = "侧视 (Side)"
+            elif abs(dy) < 1 and abs(dx) < 1:
+                view = "正视 (Front)"
+            else:
+                view = "透视 (Perspective)"
+        except Exception:
+            view = "—"
+        self._labels["默认相机视角"].setText(view)
+        self._refresh_lock = False
+
+

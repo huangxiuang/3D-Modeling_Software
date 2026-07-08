@@ -9,6 +9,8 @@ Two-page QDialog:
 import math
 import numpy as np
 from PyQt5 import QtWidgets, QtCore, QtGui
+from vtkmodules.vtkRenderingCore import vtkActor
+import matplotlib.tri as tri
 
 _HAS_MPL = True
 try:
@@ -43,7 +45,7 @@ class LayerManagementDialog(QtWidgets.QDialog):
         True → DEM scene (only sand/grass/earth available).
     """
 
-    def __init__(self, parent, layer_names, terrain_extent, is_dem_scene):
+    def __init__(self, parent, layer_names, terrain_extent, is_dem_scene, terrain_mesh=None):
         super().__init__(parent)
         self.setWindowTitle("增加图层")
         self.setMinimumSize(900, 640)
@@ -52,6 +54,7 @@ class LayerManagementDialog(QtWidgets.QDialog):
         self._is_dem = is_dem_scene
         xy_half, z_half = terrain_extent if terrain_extent else (10.0, 20.0)
         self._xy_limit = xy_half * 1.2
+        self._terrain_mesh = terrain_mesh
 
         # State
         self._layer_checks = {}       # key → QCheckBox
@@ -224,6 +227,31 @@ class LayerManagementDialog(QtWidgets.QDialog):
 
         return w
 
+    def _draw_contours(self, ax):
+        mesh = self._terrain_mesh
+        if mesh is None:
+            return
+        try:
+            surface = mesh.extract_surface()
+            pts = np.asarray(surface.points)
+            if len(pts) < 50:
+                return
+            if len(pts) > 10000:
+                step = max(1, len(pts) // 8000)
+                pts = pts[::step]
+            triang = tri.Triangulation(pts[:, 0], pts[:, 1])
+            z = pts[:, 2]
+            z_min, z_max = z.min(), z.max()
+            if z_max - z_min < 1.0:
+                return
+            n_levels = 8 if len(pts) > 3000 else 12
+            levels = np.linspace(z_min, z_max, n_levels)
+            ax.tricontour(triang, z, levels=levels,
+                          colors="gray", linewidths=0.4, alpha=0.4,
+                          zorder=0)
+        except Exception:
+            pass
+
     def _setup_axes(self):
         self._ax.clear()
         lim = self._xy_limit
@@ -235,6 +263,7 @@ class LayerManagementDialog(QtWidgets.QDialog):
         self._ax.set_ylabel("Y")
         self._ax.axhline(0, color="gray", linewidth=0.5)
         self._ax.axvline(0, color="gray", linewidth=0.5)
+        self._draw_contours(self._ax)
 
     # ── Tool management ─────────────────────────────────────
 
@@ -633,8 +662,7 @@ class ClipManagerDialog(QtWidgets.QDialog):
     @staticmethod
     def _resolve_vtk_opacity(actor):
         """Extract opacity from a VTK actor (or assembly by walking children)."""
-        import vtk
-        if isinstance(actor, vtk.vtkActor):
+        if isinstance(actor, vtkActor):
             return actor.GetProperty().GetOpacity()
         if hasattr(actor, "GetParts"):
             it = actor.GetParts()
@@ -643,6 +671,6 @@ class ClipManagerDialog(QtWidgets.QDialog):
                 part = it.GetNextPartAsObject()
                 if part is None:
                     break
-                if isinstance(part, vtk.vtkActor):
+                if isinstance(part, vtkActor):
                     return part.GetProperty().GetOpacity()
         return 1.0

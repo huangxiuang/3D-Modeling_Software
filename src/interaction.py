@@ -14,4 +14,4 @@ class InteractionMode(Enum):
     NORMAL = auto()             # Orbit / pan / zoom + object selection
     MEASURE_DISTANCE = auto()   # Left-click places distance-measurement points
     MEASURE_ANGLE = auto()      # Left-click places angle-measurement points
-    WAYPOINT = auto()           # Left-click places waypoints
+    WAYPOINT = auto()           # Left-click places 3D waypoints on terrain

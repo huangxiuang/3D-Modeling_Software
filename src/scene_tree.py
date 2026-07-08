@@ -112,31 +112,32 @@ class SceneTreeFactory:
     }
 
     _DEFAULT_FONT_SIZE = 11
+    _CATEGORY_FONT_SIZE = 14
 
     @classmethod
     def build_tree(cls, tree_widget: QtWidgets.QTreeWidget):
         """Create the static tree skeleton and return a ``{node_type: item}`` map."""
 
-        font = tree_widget.font()
-        font.setPointSize(cls._DEFAULT_FONT_SIZE)
+        default_font = tree_widget.font()
+        default_font.setPointSize(cls._DEFAULT_FONT_SIZE)
 
-        # Top level:  4 main categories
+        category_font = tree_widget.font()
+        category_font.setPointSize(cls._CATEGORY_FONT_SIZE)
+        category_font.setBold(True)
+
         items: dict = {}
 
         def _icon(symbol: str) -> QtGui.QIcon:
             """Return a transparent QIcon with the given symbol."""
             pm = QtGui.QPixmap(24, 24)
             pm.fill(Qt.transparent)
-            # We cannot trivially paint a unicode char onto a pixmap without
-            # a QPainter in scope, so we fall back to a plain text label for
-            # the icon column.  For now just return an empty icon.
             return QtGui.QIcon()
 
         def _make_item(parent, node_type, label, tooltip="",
                        icon_name="", slot_name="",
                        is_editable=False, is_deletable=False,
                        scene_obj_name=None, waypoint_index=None,
-                       aircraft_name=None):
+                       aircraft_name=None, font_override=None):
             nd = NodeData(
                 node_type=node_type,
                 label=label,
@@ -155,26 +156,46 @@ class SceneTreeFactory:
             item.setText(0, label)
             item.setData(0, Qt.UserRole, nd)
             item.setToolTip(0, nd.tooltip)
-            item.setFont(0, font)
+            item.setFont(0, font_override or default_font)
             items[node_type] = item
             return item
 
-        # ── 3 top-level root nodes ──
+        root_scene_settings = _make_item(
+            tree_widget, SceneNodeType.SCENE_SETTINGS, "场景设置",
+            font_override=category_font)
+
+        # -- Scene Settings children --------------------------------------
+        scene_info_item = cls._create_item(
+            root_scene_settings,
+            NodeData(
+                node_type=SceneNodeType.GLOBAL_TOOL,
+                label="场景信息（双击）",
+                parent_node_type=SceneNodeType.SCENE_SETTINGS,
+                tooltip="双击查看场景详细信息",
+                icon_name=SceneNodeType.GLOBAL_TOOL,
+                slot_name="_open_scene_settings_dialog",
+            ),
+        )
+        items[f"{SceneNodeType.SCENE_SETTINGS}.scene_info"] = scene_info_item
+
         root_flight   = _make_item(
-            tree_widget, SceneNodeType.FLIGHT_PLATFORM, "飞行平台")
+            root_scene_settings, SceneNodeType.FLIGHT_PLATFORM, "飞行平台",
+            font_override=category_font)
         root_path     = _make_item(
-            tree_widget, SceneNodeType.PATH_PLANNING, "路径规划")
+            root_scene_settings, SceneNodeType.PATH_PLANNING, "路径规划",
+            font_override=category_font)
         root_anim     = _make_item(
-            tree_widget, SceneNodeType.ANIMATION_TASK, "动画与任务")
+            root_scene_settings, SceneNodeType.ANIMATION_TASK, "动画与任务",
+            font_override=category_font)
 
         # -- Flight children are added dynamically by _populate_aircraft_nodes
         #    (no static children here)
 
         # -- Path Planning children --------------------------------------
         path_children: List[tuple] = [
-            ("添加路径点 (点击场景)",  SceneNodeType.PATH_ACTION, "_on_wp_button"),
-            ("精准添加路径",           SceneNodeType.PATH_ACTION, "_open_precise_wp_dialog"),
-            ("清除所有路径点",         SceneNodeType.PATH_ACTION, "_clear_waypoints"),
+            ("添加3D路径点（单击场景）",   SceneNodeType.PATH_ACTION, "_toggle_wp_mode"),
+            ("精准添加路径（双击）",     SceneNodeType.PATH_ACTION, "_open_precise_wp_dialog"),
+            ("清除所有路径点（双击）",   SceneNodeType.PATH_ACTION, "_clear_waypoints"),
         ]
 
         for label, nt, slot in path_children:
@@ -193,10 +214,10 @@ class SceneTreeFactory:
 
         # -- Animation / Task children -----------------------------------
         anim_children: List[tuple] = [
-            ("开始飞行 / 停止飞行", SceneNodeType.ANIM_ACTION, "_toggle_flight"),
-            ("编队飞行",            SceneNodeType.ANIM_ACTION, "_on_formation_toggled"),
-            ("保存飞行数据",        SceneNodeType.ANIM_ACTION, "_save_flight_data"),
-            ("载入飞行数据",        SceneNodeType.ANIM_ACTION, "_load_flight_data"),
+            ("开始飞行 / 停止飞行（双击）", SceneNodeType.ANIM_ACTION, "_toggle_flight"),
+            ("编队飞行",                   SceneNodeType.ANIM_ACTION, "_on_formation_toggled"),
+            ("保存飞行数据（双击）",        SceneNodeType.ANIM_ACTION, "_save_flight_data"),
+            ("载入飞行数据（双击）",        SceneNodeType.ANIM_ACTION, "_load_flight_data"),
         ]
 
         for label, nt, slot in anim_children:
