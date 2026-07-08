@@ -888,12 +888,16 @@ class MainWindow(QtWidgets.QMainWindow):
         lo.addWidget(self._btn_save_flight)
         self._btn_load_flight = QtWidgets.QPushButton("载入飞行数据")
         lo.addWidget(self._btn_load_flight)
-        self._btn_formation = QtWidgets.QPushButton("编队飞行")
+        self._btn_formation = QtWidgets.QPushButton("开始编队")
         self._btn_formation.setCheckable(True)
         self._btn_formation.setStyleSheet(
             "QPushButton:checked { background-color: #4a90d9; color: white; font-weight: bold; }")
         self._btn_formation.toggled.connect(self._on_formation_toggled)
         lo.addWidget(self._btn_formation)
+        self._btn_cancel_formation = QtWidgets.QPushButton("取消编队")
+        self._btn_cancel_formation.clicked.connect(self._cancel_formation)
+        self._btn_cancel_formation.setVisible(False)
+        lo.addWidget(self._btn_cancel_formation)
         self._formation_list = QtWidgets.QListWidget()
         self._formation_list.setMaximumHeight(100)
         self._formation_list.setVisible(False)
@@ -1161,7 +1165,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if name in self._formation_aircraft:
             self._formation_aircraft.remove(name)
             self._formation_offsets.pop(name, None)
+        # Clean up flight preview line if present
+        if self._path_actor is not None:
+            try:
+                self.plotter.remove_actor(self._path_actor)
+            except Exception:
+                pass
+            self._path_actor = None
         self._rebuild_waypoint_actors()
+        self._refresh_waypoint_tree()
+        self._populate_aircraft_nodes()
         self._log_action(f"用户删除了飞机: {name}")
 
     def _delete_waypoint(self, ac_name, wp_idx):
@@ -1276,24 +1289,55 @@ class MainWindow(QtWidgets.QMainWindow):
             self._on_obj_select_changed(idx)
 
     def _open_flight_aircraft_dialog(self):
-        """Show independent dialog to select which aircraft to fly."""
+        """Show dialog to select which aircraft to fly (checkboxes) + delay option."""
         names = [n for n in self.scene_objects if "aircraft" in n.lower()]
         if not names:
             self.statusBar().showMessage("⚠ 当前场景无飞机", 3000)
             return
+
+        # If formation mode, ask which waypoints to use
+        if self._formation_mode:
+            self._open_formation_flight_dialog()
+            return
+
         dlg = QtWidgets.QDialog(self)
         dlg.setWindowTitle("选择飞行飞机")
         dlg.setWindowFlags(dlg.windowFlags() | QtCore.Qt.Window)
-        dlg.resize(320, 250)
+        dlg.resize(350, 300)
         lo = QtWidgets.QVBoxLayout(dlg)
-        lo.addWidget(QtWidgets.QLabel("请选择要执行飞行的飞机:"))
-        lst = QtWidgets.QListWidget()
+        lo.addWidget(QtWidgets.QLabel("勾选要飞行的飞机（可多选）:"))
+        checks = {}
         for n in names:
-            item = QtWidgets.QListWidgetItem(n)
+            chk = QtWidgets.QCheckBox(n)
             if n == self._flight_aircraft_combo.currentText():
-                item.setSelected(True)
-            lst.addItem(item)
-        lo.addWidget(lst)
+                chk.setChecked(True)
+            lo.addWidget(chk)
+            checks[n] = chk
+
+        # Delay options (shown if >1 selected)
+        delay_widget = QtWidgets.QWidget()
+        delay_lo = QtWidgets.QVBoxLayout(delay_widget)
+        delay_lo.setContentsMargins(0, 0, 0, 0)
+        delay_chk = QtWidgets.QCheckBox("启用延迟出发")
+        delay_lo.addWidget(delay_chk)
+        delay_form = QtWidgets.QFormLayout()
+        delay_spins = {}
+        for n in names[1:]:
+            sb = QtWidgets.QDoubleSpinBox()
+            sb.setRange(0, 300); sb.setValue(0); sb.setSuffix(" 秒")
+            delay_spins[n] = sb
+            delay_form.addRow(f"{n} 延迟:", sb)
+        delay_lo.addLayout(delay_form)
+        delay_widget.setVisible(False)
+        lo.addWidget(delay_widget)
+
+        # Show/hide delay based on checkbox count
+        def _update_delay_visibility():
+            cnt = sum(1 for c in checks.values() if c.isChecked())
+            delay_widget.setVisible(cnt > 1)
+        for chk in checks.values():
+            chk.toggled.connect(_update_delay_visibility)
+
         btns = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         btns.accepted.connect(dlg.accept)
@@ -1301,13 +1345,76 @@ class MainWindow(QtWidgets.QMainWindow):
         lo.addWidget(btns)
         if dlg.exec_() != QtWidgets.QDialog.Accepted:
             return
-        sel = lst.currentItem()
-        if sel is None:
+
+        selected = [n for n in names if checks[n].isChecked()]
+        if not selected:
             return
-        # Set combo and start flight
-        idx = self._flight_aircraft_combo.findText(sel.text())
-        if idx >= 0:
-            self._flight_aircraft_combo.setCurrentIndex(idx)
+        self._execute_flight(selected, delay_spins if delay_chk.isChecked() else {})
+
+    def _execute_flight(self, selected, delays=None):
+        """Start flight for list of aircraft with optional per-aircraft delays."""
+        if delays is None or not delays:
+            for n in selected:
+                self._flight_aircraft_combo.setCurrentText(n)
+                self._start_flight()
+        else:
+            # Start first aircraft immediately, delay others
+            self._flight_aircraft_combo.setCurrentText(selected[0])
+            self._start_flight()
+            for n in selected[1:]:
+                d = delays.get(n, 0)
+                if d > 0:
+                    def _delayed(name=n):
+                        self._flight_aircraft_combo.setCurrentText(name)
+                        self._start_flight()
+                    QtCore.QTimer.singleShot(int(d * 1000), _delayed)
+
+    def _open_formation_flight_dialog(self):
+        names = [n for n in self.scene_objects if "aircraft" in n.lower()]
+        wp_options = []
+        for n in names:
+            wps = self._aircraft_waypoints.get(n, [])
+            if wps:
+                wp_options.append((n, f"{n} 的路径点 ({len(wps)} 个)"))
+        if not wp_options:
+            self.statusBar().showMessage("⚠ 编队中无可用路径点", 3000)
+            return
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("编队飞行 — 选择路径点")
+        dlg.setWindowFlags(dlg.windowFlags() | QtCore.Qt.Window)
+        dlg.resize(350, 250)
+        lo = QtWidgets.QVBoxLayout(dlg)
+        lo.addWidget(QtWidgets.QLabel("选择编队使用的路径点来源:"))
+        sel = QtWidgets.QListWidget()
+        for n, label in wp_options:
+            sel.addItem(label)
+        sel.setCurrentRow(0)
+        lo.addWidget(sel)
+        dlg._result = None  # None=cancel, "custom"=XY dialog, int=wp_options index
+        btn_custom = QtWidgets.QPushButton("自定义编队路径点 (XY图)")
+        btn_custom.clicked.connect(lambda: [setattr(dlg, '_result', 'custom'), dlg.accept()])
+        lo.addWidget(btn_custom)
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        btns.accepted.connect(lambda: setattr(dlg, '_result', sel.currentRow()))
+        btns.rejected.connect(dlg.reject)
+        lo.addWidget(btns)
+        if dlg.exec_() != QtWidgets.QDialog.Accepted or dlg._result is None:
+            return
+        if dlg._result == 'custom':
+            self._open_precise_wp_dialog()
+            return
+        row = dlg._result
+        if row < 0 or row >= len(wp_options):
+            return
+        leader_name = wp_options[row][0]
+        leader_wps = self._aircraft_waypoints.get(leader_name, [])
+        for n in self._formation_aircraft:
+            self._aircraft_waypoints[n] = [np.array(w) for w in leader_wps]
+        self._rebuild_waypoint_actors()
+        self._refresh_waypoint_tree()
+        self._flight_aircraft_combo.setCurrentText(self._formation_aircraft[0])
         self._start_flight()
 
     def _toggle_flight(self):
@@ -3008,6 +3115,48 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log_action(f"添加路径点 ({wp[0]:.2f}, {wp[1]:.2f}, {wp[2]:.2f}) → {names_str}")
         self.statusBar().showMessage(f"路径点已添加到: {names_str}", 3000)
 
+    def _add_waypoints_batch(self, coords_list):
+        """Add multiple waypoints at once — ask aircraft selection once."""
+        names = [n for n in self.scene_objects if "aircraft" in n.lower()]
+        if not names:
+            self.statusBar().showMessage("⚠ 当前场景无飞机", 3000)
+            return
+        for i, n in enumerate(names):
+            if n not in self._aircraft_colors:
+                self._aircraft_colors[n] = self._color_palette[i % len(self._color_palette)]
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("选择目标飞机")
+        dlg.setWindowFlags(dlg.windowFlags() | QtCore.Qt.Window)
+        dlg.resize(300, 220)
+        lo = QtWidgets.QVBoxLayout(dlg)
+        lo.addWidget(QtWidgets.QLabel(f"将 {len(coords_list)} 个路径点添加到:"))
+        checks = {}
+        for n in names:
+            chk = QtWidgets.QCheckBox(n)
+            chk.setChecked(True)
+            lo.addWidget(chk)
+            checks[n] = chk
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        lo.addWidget(btns)
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        added = []
+        for n in names:
+            if checks[n].isChecked():
+                for xyz in coords_list:
+                    self._aircraft_waypoints.setdefault(n, []).append(np.array(xyz))
+                added.append(n)
+        if not added:
+            return
+        self._rebuild_waypoint_actors()
+        self._refresh_waypoint_tree()
+        names_str = ", ".join(added)
+        self._log_action(f"批量添加 {len(coords_list)} 个路径点 → {names_str}")
+        self.statusBar().showMessage(f"{len(coords_list)} 个路径点已添加到: {names_str}", 3000)
+
     def _refresh_waypoint_tree(self):
         """Refresh waypoint tree nodes under all aircraft — auto-expand."""
         flight_root = self._tree_items.get(SceneNodeType.FLIGHT_PLATFORM)
@@ -3079,8 +3228,8 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg = WaypointPreciseDialog(self, terrain_extent=extent, terrain_mesh=terrain_mesh)
         if dlg.exec_() == QtWidgets.QDialog.Accepted:
             coords_list = dlg.get_coords()
-            for xyz in coords_list:
-                self._add_waypoint(np.array(xyz))
+            if coords_list:
+                self._add_waypoints_batch(coords_list)
 
     def _clear_waypoints(self):
         if not self.waypoints and not self._wp_actors and not any(self._aircraft_waypoints.values()):
@@ -3139,12 +3288,38 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._formation_mode = False
                 self._btn_formation.setChecked(False)
                 return
+            # Save a snapshot of current waypoints for cancel/restore
+            self._formation_saved_wp = {
+                n: [np.array(w) for w in self._aircraft_waypoints.get(n, [])]
+                for n in self.scene_objects if "aircraft" in n.lower()
+            }
         self._formation_mode = checked
         self._formation_list.setVisible(checked)
+        self._btn_cancel_formation.setVisible(checked)
+        self._btn_formation.setText("编队中..." if checked else "开始编队")
         if checked:
             self._refresh_formation_list()
-        state = "开启" if checked else "关闭"
-        self._log_action(f"用户{state}了编队飞行模式")
+        self._log_action(f"用户{'开启' if checked else '关闭'}了编队飞行模式")
+
+    def _cancel_formation(self):
+        """Cancel formation and restore all aircraft to their original waypoints."""
+        if hasattr(self, '_formation_saved_wp'):
+            self._aircraft_waypoints.clear()
+            for n, wps in self._formation_saved_wp.items():
+                if wps:
+                    self._aircraft_waypoints[n] = [np.array(w) for w in wps]
+            del self._formation_saved_wp
+        self._formation_mode = False
+        self._btn_formation.setChecked(False)
+        self._btn_formation.setText("开始编队")
+        self._formation_list.setVisible(False)
+        self._btn_cancel_formation.setVisible(False)
+        self._formation_aircraft.clear()
+        self._formation_offsets.clear()
+        self._rebuild_waypoint_actors()
+        self._refresh_waypoint_tree()
+        self._log_action("用户取消了编队，路径点已恢复")
+        self.statusBar().showMessage("编队已取消，路径点已恢复", 3000)
 
     def _refresh_formation_list(self):
         """Populate the formation list with checkable aircraft items."""
