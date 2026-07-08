@@ -4121,7 +4121,7 @@ class AboutDialog(QtWidgets.QDialog):
         lo = QtWidgets.QVBoxLayout(self)
         lo.setSpacing(8)
 
-        title = QtWidgets.QLabel("3DSceneSoftware v2.4")
+        title = QtWidgets.QLabel("3DSceneSoftware v2.5.1")
         title.setStyleSheet("font-size: 20px; font-weight: bold; color: #1a1a2e;")
         lo.addWidget(title)
 
@@ -4136,54 +4136,48 @@ class AboutDialog(QtWidgets.QDialog):
         notes.setHtml("""
 <h3>Release Notes</h3>
 <hr>
+<h4>v2.5.1 — 2026-07-08</h4>
+<ul>
+<li><b>多机并发飞行重构:</b> _flights dict 每架飞机独立 QTimer + 独立状态，延迟出发支持多机勾选+延迟秒数</li>
+<li><b>编队系统完全重建:</b> 树节点编队对象(编队1+子节点) + 僚机跟随(leader_pos - trail*d*cos(yaw)) + 自定义路径直接给编队</li>
+<li><b>编队自动取消:</b> 删除编队任一成员 → 树节点删除+路径点恢复+UI重置</li>
+<li><b>修复:</b> 删除飞机后其他飞机树节点消失、编队节点被清、_catmull_rom_position丢失导致飞行不飞</li>
+<li><b>修复:</b> timeline slider blockSignals 防止延迟飞行重置首架飞机状态</li>
+<li><b>修复:</b> QDoubleSpinBox→float 转换、formation 变量未定义、DEM 导入崩溃</li>
+<li><b>修复:</b> 保存/载入飞行数据崩溃、_clear_waypoints 同步清 _aircraft_waypoints</li>
+<li><b>UX:</b> Ctrl+Z 滑块撤销栈(50步)、破坏操作确认对话框、静默失败 Toast 通知</li>
+<li><b>用户手册:</b> 完整 HTML 网页版(18张截图) + 帮助菜单入口</li>
+</ul>
+
+<h4>v2.5 — 2026-07-08</h4>
+<ul>
+<li><b>事件驱动架构:</b> _on_terrain_changed 自动清路径点+停飞+刷新UI+日志记录</li>
+<li><b>魔法数字集中化:</b> 30+ 硬编码常量统一到 config.py</li>
+<li><b>DEM场景修复:</b> 切换回默认场景相机自动重置 + Z夸大实时重调</li>
+<li><b>UX防御:</b> 破坏操作确认+Toast通知+_log_action hasattr守卫</li>
+<li>精准添加路径批量飞机选择(一次弹窗) + 飞行弹窗勾选多机</li>
+</ul>
+
 <h4>v2.4 — 2026-07-08</h4>
 <ul>
-<li><b>修复:</b> macOS Apple Silicon + Rosetta 2 环境下 VTK 启动死锁 — 用 4 个精确导入替代 <code>import vtk</code>（144 个 x86_64 .so 模块），启动时间从 30s+（超时）降至 ~8s</li>
-<li><b>修复:</b> Retina 屏鼠标拾取偏移 — <code>_to_vtk_display()</code> 去掉 devicePixelRatio 倍乘，VTK render window 报告逻辑像素，提逻辑坐标即可</li>
-<li><b>新增:</b> 场景信息独立窗口（双击场景设置 → 场景信息）— 自动刷新坐标系/地形尺寸/Z偏移/垂直夸张/相机视角</li>
-<li><b>新增:</b> 操作日志导出（文件 → 导出操作日志... → .log 文件）</li>
-<li><b>恢复:</b> 添加3D路径点（单击场景）— 路径规划树节点支持单击 scene 放置路径点</li>
-<li><b>恢复:</b> 路径规划 WaypointPreciseDialog + LayerManagementDialog 等高线支持</li>
-<li><b>修复:</b> DEM 导入后垂直夸张系数正确保存到 config，场景信息实时显示</li>
-<li><b>修复:</b> 坐标系从硬编码 "WGS84 (经纬度)" 改为动态读取 config (ENU + DEM CRS)</li>
+<li><b>修复:</b> macOS Apple Silicon + Rosetta 2 环境下 VTK 启动死锁 — 4个精确导入替代 144 模块</li>
+<li><b>修复:</b> Retina 屏鼠标拾取偏移 — _to_vtk_display 去掉 scale 倍乘</li>
+<li><b>新增:</b> 场景信息独立窗口 + 操作日志导出 + 每飞机独立颜色路径点</li>
+<li>About 独立窗口 release notes</li>
 </ul>
 
-<h4>v2.3 — 2026-07-07</h4>
+<h4>v2.2～v2.3 — 2026-07-06~07</h4>
 <ul>
-<li>UI 重构：场景树 + 属性面板 QStackedWidget + 坐标简化</li>
-<li>ASC 格网导入/导出 (ESRI ASCII Grid 格式)</li>
-<li>飞行按钮修复 / 编队僚机重叠修复</li>
-<li>删除坐标系切换 (ENU/FLU/NED/NWU)</li>
-</ul>
-
-<h4>v2.2 — 2026-07-06</h4>
-<ul>
-<li>图层管理对话框 (XY 绘图工具 + 矩形/圆形/多边形选区)</li>
-<li>3D 交互鲁棒性改进 (picker 精度提升)</li>
-<li>DEM 保存/载入修复 (X,Y 网格完整重构)</li>
-<li>DEM 相机视图动态范围 / 飞机缩放到 2000×</li>
-<li>删除 STL/OBJ 导入</li>
-</ul>
-
-<h4>v2.1 — 2026-07-06</h4>
-<ul>
-<li>鼠标坐标精度修复 (Retina 屏幕 1px 偏差)</li>
-<li>图层管理移至菜单 / Z 夸张选项 / 飞机默认高度 7000m</li>
-<li>精准路径点 XY 自动范围</li>
-</ul>
-
-<h4>v2.0 — 2026-07-06</h4>
-<ul>
-<li>PyVista extract_surface() 崩溃修复</li>
+<li>UI重构(场景树+属性面板) / ASC导入导出 / 飞行编队修复</li>
+<li>图层管理对话框 / DEM保存载入 / 3D交互鲁棒性</li>
+<li>鼠标坐标Retina修复 / 飞机默认7000m / DEM相机动态范围</li>
 </ul>
 
 <h4>v1.x — 2026-06-29 ~ 2026-07-03</h4>
 <ul>
-<li>飞机姿态控制 (Yaw/Pitch/Roll 局部旋转)</li>
-<li>路径点动态飞行 (Catmull-Rom 样条 + 速度模型)</li>
-<li>时间轴 / 编队飞行 / DEM 图层管理</li>
-<li>保存/载入 JSON 数据 / 测量工具 / 碰撞检测</li>
-<li>FlightWindow 独立窗口 (macOS 双 QVTK 已废弃)</li>
+<li>飞机姿态控制(Yaw/Pitch/Roll 局部旋转) / 路径点动态飞行(Catmull-Rom+速度模型)</li>
+<li>时间轴 / 编队飞行 / DEM图层管理 / 保存载入JSON数据</li>
+<li>测量工具 / 碰撞检测 / FlightWindow独立窗口(macOS双QVTK已废弃)</li>
 </ul>
 """)
         lo.addWidget(notes)
@@ -4635,7 +4629,7 @@ class SceneSettingsDialog(QtWidgets.QDialog):
         QtCore.QTimer.singleShot(0, self._refresh)
 
     def _refresh(self) -> None:
-        """Refresh all labels — called on init (deferred) and every 1 s."""
+        """Refresh all labels - called on init (deferred) and every 1 s."""
         if self._refresh_lock:
             return
         self._refresh_lock = True
