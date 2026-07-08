@@ -367,8 +367,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_obj_combo()
         self._refresh_scene_objects_ui()
         self._sync_obj_combo_selection("aircraft")
-        self._lazy_load_waypoints(
-            self._tree_items.get(SceneNodeType.AIRCRAFT), "aircraft")
+        # Find aircraft tree node from flight platform
+        flight_root = self._tree_items.get(SceneNodeType.FLIGHT_PLATFORM)
+        if flight_root:
+            for i in range(flight_root.childCount()):
+                child = flight_root.child(i)
+                ds = child.data(0, Qt.UserRole)
+                if ds and ds.scene_obj_name == "aircraft":
+                    self._lazy_load_waypoints(child, "aircraft")
+                    break
 
         # 4. Log
         mode = "DEM" if self._dem_scene_active else "默认"
