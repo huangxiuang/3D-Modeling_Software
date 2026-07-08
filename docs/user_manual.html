@@ -573,34 +573,62 @@
 <h2>10.2 开始飞行</h2>
 <div class="step">
   <strong>①</strong> 展开 "动画与任务"，双击 <strong>"开始飞行 / 停止飞行（双击）"</strong><br>
-  <strong>②</strong> 在弹出窗口中选择要飞行的飞机 → 点击"确定"<br>
-  <strong>③</strong> 飞行路径预览线（青色）出现<br>
-  <strong>④</strong> 飞机瞬移到第一个路径点，开始沿样条曲线飞行<br>
-  <strong>⑤</strong> 底部时间轴实时更新，显示当前时间/总时间
+  <strong>②</strong> 在弹出窗口中<strong>勾选</strong>要飞行的飞机（可多选）<br>
+  <strong>③</strong> 如选 ≥2 架：可启用<strong>延迟出发</strong>，设置后续飞机的延迟秒数<br>
+  <strong>④</strong> 飞行路径预览线（青色）出现<br>
+  <strong>⑤</strong> 飞机瞬移到第一个路径点，沿 Catmull-Rom 样条曲线飞行<br>
+  <strong>⑥</strong> 底部时间轴实时更新，显示当前时间/总时间
 </div>
 
 <h2>10.3 飞行中交互</h2>
 <ul>
   <li><strong>时间轴拖动</strong>: 拖动底部滑块可跳转到任意时刻（拖拽时飞行暂停，释放后恢复）</li>
   <li><strong>时间轴点击</strong>: 点击滑块轨道可跳转到该时刻并继续播放</li>
-  <li><strong>停止飞行</strong>: 再次双击 "开始飞行 / 停止飞行（双击）"</li>
-  <li><strong>独立窗口选飞机</strong>: 飞行前均可通过独立对话框选择要飞行的飞机</li>
+  <li><strong>停止飞行</strong>: 点击 "停止飞行" 按钮或再次双击树节点</li>
+  <li><strong>多机并发飞行 <span class="badge">v2.5.1</span></strong>: 可同时选多架飞机各自独立飞行（每机独立 Tick）</li>
+  <li><strong>延迟出发 <span class="badge">v2.5.1</span></strong>: 多选后启用延迟，第二架延迟 N 秒后加入飞行</li>
 </ul>
 
-<h2>10.4 多飞机独立路径点飞行 <span class="badge">v2.5新功能</span></h2>
-<p>每架飞机拥有<strong>独立的路径点列表</strong>和<strong>专属颜色</strong>。飞行时各自按自己的路径飞行。</p>
+<h2>10.4 多飞机独立路径点飞行 <span class="badge">v2.5.1</span></h2>
+<p>每架飞机拥有<strong>独立的路径点列表</strong>和<strong>专属颜色</strong>。多机可<strong>同时</strong>飞行，互不干扰。</p>
 <div class="step">
   <strong>①</strong> 在路径点模式下，为 aircraft 添加一组红色路径点<br>
   <strong>②</strong> 为 aircraft2 添加一组蓝色路径点<br>
-  <strong>③</strong> 双击 "开始飞行" → 选 aircraft → 沿红色路径点飞行<br>
-  <strong>④</strong> 停止后，双击 "开始飞行" → 选 aircraft2 → 沿蓝色路径点飞行
+  <strong>③</strong> 双击 "开始飞行" → 勾选 aircraft + aircraft2 → 两架同时飞
 </div>
 
-<h2>10.5 编队飞行</h2>
-<p>见 8.9 节。</p>
+<h2>10.5 编队飞行 <span class="badge">v2.5.1 重建</span></h2>
+<div class="card">
+  <h3>创建编队</h3>
+  <div class="step">
+    <strong>①</strong> 属性面板点击 <strong>"开始编队"</strong> → 弹出对话框勾选编队成员 → 确定<br>
+    <strong>②</strong> 左侧飞行平台出现 <strong>"编队1 (aircraft+aircraft2)"</strong> 树节点<br>
+    <strong>③</strong> 编队节点下有子节点：<br>
+    &nbsp;&nbsp;· <strong>为编队选择路径点（双击）</strong> — 可选飞机路径点或自定义XY图<br>
+    &nbsp;&nbsp;· <strong>编队路径点 1/2/3...</strong> — 路径点列表<br>
+    &nbsp;&nbsp;· <strong>编队开始飞行（双击）</strong> — 直接飞，不弹窗
+  </div>
+  <h3>僚机跟随算法</h3>
+  <p>每 tick (50ms) 计算：</p>
+  <pre style="background:#f5f5f5; padding:8px; border-radius:4px; font-size:13px;">
+follower_j 位置 = leader 位置 - trail_dist × (j+1) × (cos(yaw), sin(yaw), 0)
+  其中 trail_dist = 3.0 (默认) 或 AIRCRAFT_SCALE×0.005 (DEM)
+  第二架拖尾 3 单位，第三架 6 单位... 均保持等距
+  僚机朝向与领队相同
+  </pre>
+  <h3>取消编队</h3>
+  <div class="step">
+    <strong>①</strong> 点击属性面板 <strong>"取消编队"</strong> 按钮 → 编队树节点删除<br>
+    <strong>②</strong> 所有飞机路径点恢复到编队前状态<br>
+    <strong>③</strong> 删除编队任一成员 → 自动取消整个编队
+  </div>
+</div>
 
 <h2>10.6 飞行路径预览线</h2>
 <p>飞行启动后，青色预览线出现并保留在 3D 视口中。飞行结束后可通过"清除所有路径点"移除。</p>
+
+<h2>10.7 飞机速度模型</h2>
+<p>飞行速度 V = V₀ × k_pitch × k_turn（V₀ = 5.0 单位/秒）。爬升减速、俯冲加速、转弯减速。详见 编程算法概要.md。</p>
 
 <!-- ═══════════════════════════════════════════════════ -->
 <h1 id="bottom">11. 底部面板</h1>
