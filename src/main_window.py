@@ -1143,15 +1143,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._aircraft_waypoints.pop(name, None)
         self._aircraft_colors.pop(name, None)
         self._stop_flight(name)
-        # Remove from formation if member of any
         for fname, form in list(self._formations.items()):
             if name in form["members"]:
-                form["members"].remove(name)
-        if any(not f["members"] for f in self._formations.values()):
-            self._formations.clear()
-            self._btn_formation.setText("开始编队")
-            self._btn_formation.setEnabled(True)
-            self._btn_cancel_formation.setVisible(False)
+                self._cancel_formation()
+                break
         # Clean up flight preview line if present
         if self._path_actor is not None:
             try:
