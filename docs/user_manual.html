@@ -1,0 +1,694 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3DSceneSoftware — 用户手册 v2.5</title>
+<style>
+  :root { --c-primary: #1a1a2e; --c-accent: #2a66b0; --c-bg: #f8f9fa; --c-card: #fff; --c-border: #e0e0e0; --c-code: #e8f0fe; --c-warn: #fff3cd; --c-success: #d4edda; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans SC", sans-serif; background: var(--c-bg); color: #333; line-height: 1.7; }
+  nav { position: sticky; top: 0; background: var(--c-primary); color: #fff; padding: 10px 20px; z-index: 100; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  nav a { color: #aac; text-decoration: none; font-size: 13px; padding: 4px 8px; border-radius: 4px; }
+  nav a:hover { background: rgba(255,255,255,.15); }
+  nav .brand { font-weight: 700; font-size: 16px; color: #fff; margin-right: 16px; }
+  .container { max-width: 960px; margin: 0 auto; padding: 20px 20px 60px; }
+  h1 { font-size: 28px; color: var(--c-primary); border-bottom: 3px solid var(--c-accent); padding-bottom: 8px; margin: 40px 0 20px; }
+  h2 { font-size: 22px; color: var(--c-accent); margin: 32px 0 14px; padding-left: 8px; border-left: 4px solid var(--c-accent); }
+  h3 { font-size: 17px; color: #444; margin: 22px 0 10px; }
+  p, li { font-size: 15px; margin-bottom: 8px; }
+  ul, ol { padding-left: 24px; margin-bottom: 12px; }
+  .card { background: var(--c-card); border: 1px solid var(--c-border); border-radius: 8px; padding: 18px 22px; margin: 14px 0; box-shadow: 0 1px 3px rgba(0,0,0,.06); }
+  .card h3 { margin-top: 0; }
+  .step { background: var(--c-code); border-radius: 6px; padding: 12px 18px; margin: 10px 0; font-size: 14px; }
+  .step strong { color: var(--c-accent); }
+  .screenshot { background: #f0f0f0; border: 2px dashed #ccc; border-radius: 8px; padding: 40px 20px; text-align: center; margin: 14px 0; color: #999; font-size: 14px; }
+  .tip { background: var(--c-warn); border-left: 4px solid #f0ad4e; padding: 10px 16px; margin: 10px 0; border-radius: 4px; font-size: 14px; }
+  .note { background: var(--c-success); border-left: 4px solid #28a745; padding: 10px 16px; margin: 10px 0; border-radius: 4px; font-size: 14px; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 14px; }
+  th, td { border: 1px solid var(--c-border); padding: 8px 12px; text-align: left; }
+  th { background: #f0f0f0; font-weight: 600; }
+  .toc { columns: 2; column-gap: 24px; }
+  .toc li { margin-bottom: 4px; }
+  .badge { display: inline-block; background: var(--c-accent); color: #fff; padding: 2px 8px; border-radius: 10px; font-size: 12px; margin-left: 6px; }
+</style>
+</head>
+<body>
+
+<nav>
+  <span class="brand">3DSceneSoftware 用户手册</span>
+  <a href="#intro">简介</a>
+  <a href="#interface">界面总览</a>
+  <a href="#file">文件菜单</a>
+  <a href="#view">视角菜单</a>
+  <a href="#tools">工具菜单</a>
+  <a href="#layer">图层菜单</a>
+  <a href="#help">帮助菜单</a>
+  <a href="#scene-tree">场景树</a>
+  <a href="#3d">3D视口</a>
+  <a href="#flight">飞行动画</a>
+  <a href="#faq">常见问题</a>
+</nav>
+
+<div class="container">
+
+<!-- ═══════════════════════════════════════════════════ -->
+<h1 id="intro">1. 产品简介</h1>
+<p>3DSceneSoftware 是一款基于 <strong>PyQt5 + PyVista (VTK 引擎)</strong> 的 3D 大场景可视化与目标建模桌面软件。您可以用它：</p>
+<ul>
+  <li>导入 <strong>DEM 数字高程模型</strong>（.img / .tif），自动构建三维地形</li>
+  <li>在三维场景中放置多架飞机，规划飞行路径</li>
+  <li>让飞机沿路径点飞行，支持编队、时间轴拖动、速度建模</li>
+  <li>测量地形上的距离和角度</li>
+  <li>管理地形图层（沙地、草地、土地、河流、植被）</li>
+  <li>导入/导出 ASC 格网高程数据</li>
+  <li>录制连续截图、导出操作日志</li>
+</ul>
+<div class="screenshot">📷 截图占位: 软件启动后的完整界面</div>
+
+<!-- ═══════════════════════════════════════════════════ -->
+<h1 id="interface">2. 界面总览</h1>
+<div class="screenshot">📷 截图占位: 界面分区标注图</div>
+<p>软件界面分为 6 个主要区域:</p>
+<table>
+  <tr><th>区域</th><th>位置</th><th>功能</th></tr>
+  <tr><td>菜单栏</td><td>顶部</td><td>文件、视角、工具、图层、帮助</td></tr>
+  <tr><td>工具栏</td><td>菜单栏下方</td><td>快捷按钮：俯视/侧视/复位/测距/测角/清除/撤销/截图/录制</td></tr>
+  <tr><td>场景树 (左侧Dock)</td><td>左侧</td><td>场景元素层级树：场景设置 → 飞行平台/路径规划/动画与任务</td></tr>
+  <tr><td>3D 视口 (中央)</td><td>中央主区域</td><td>三维渲染视口：地形、飞机、路径点、测量线等</td></tr>
+  <tr><td>属性面板 (右侧Dock)</td><td>右侧</td><td>选中对象的属性控制（位置/缩放/姿态/飞行控制）</td></tr>
+  <tr><td>底部栏</td><td>底部</td><td>左侧：操作日志；右侧：鼠标坐标信息；飞行时间轴</td></tr>
+</table>
+
+<!-- ═══════════════════════════════════════════════════ -->
+<h1 id="file">3. 文件菜单 (<code>文件</code>)</h1>
+
+<h2 id="file-save">3.1 保存数据</h2>
+<div class="card">
+  <h3>功能</h3>
+  <p>将当前场景中的所有飞机位置、姿态、缩放，以及地形高程数据，保存为 JSON 文件到 <code>data/aircraft/</code> 和 <code>data/terrain/</code> 目录。</p>
+  <h3>操作流程</h3>
+  <div class="step">
+    <strong>①</strong> 点击菜单 <code>文件 → 保存数据...</code><br>
+    <strong>②</strong> 在弹出的对话框中输入文件名（如 "mission1"），点击"保存"<br>
+    <strong>③</strong> 系统自动生成两个 JSON 文件：<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<code>data/aircraft/mission1.json</code> — 所有飞机的变换数据<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<code>data/terrain/mission1.json</code> — 地形高程数据 + 所有非飞机对象的变换<br>
+    <strong>④</strong> 操作日志和状态栏显示"数据已保存"
+  </div>
+  <div class="tip">💡 <strong>提示</strong>: 保存时包含所有对象的完整变换状态（位置、旋转、缩放），载入后可完全恢复。</div>
+  <div class="screenshot">📷 截图占位: 保存数据对话框</div>
+</div>
+
+<h2 id="file-load">3.2 载入数据</h2>
+<div class="card">
+  <h3>操作流程</h3>
+  <div class="step">
+    <strong>①</strong> 点击 <code>文件 → 载入数据...</code><br>
+    <strong>②</strong> 选择 <code>data/aircraft/</code> 或 <code>data/terrain/</code> 目录下的 JSON 文件<br>
+    <strong>③</strong> 系统自动判断文件类型并恢复对应数据：<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;选 aircraft JSON → 恢复所有飞机的位置/姿态/缩放<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;选 terrain JSON → 恢复地形高程 + 河流/植被等对象<br>
+    <strong>④</strong> 3D 视口立即刷新，显示恢复后的场景状态
+  </div>
+  <div class="tip">💡 <strong>注意</strong>: 载入数据会覆盖当前场景中对应类型的数据，请确保已保存当前工作。</div>
+  <div class="screenshot">📷 截图占位: 载入数据文件选择对话框</div>
+</div>
+
+<h2 id="file-screenshot">3.3 截图</h2>
+<div class="card">
+  <div class="step">
+    <strong>①</strong> 点击 <code>文件 → 截图...</code><br>
+    <strong>②</strong> 选择保存位置和文件名（默认 PNG 格式）<br>
+    <strong>③</strong> 3D 视口当前画面被保存为图片文件
+  </div>
+</div>
+
+<h2 id="file-recording">3.4 连续截图 (录制)</h2>
+<div class="card">
+  <p>自动以固定间隔截取 3D 视口画面，类似于"录屏"效果。</p>
+  <div class="step">
+    <strong>①</strong> 点击 <code>文件 → 连续截图 (录制) 开/关</code><br>
+    <strong>②</strong> 首次开启时会弹出目录选择对话框，选择截图保存位置<br>
+    <strong>③</strong> 系统以固定帧率持续截图到该目录，文件名格式为 <code>frame_0001.png</code><br>
+    <strong>④</strong> 再次点击同一菜单项 → 停止录制
+  </div>
+  <div class="tip">💡 <strong>用途</strong>: 可用于录制飞行动画、地形浏览等操作过程。</div>
+</div>
+
+<h2 id="file-dem">3.5 导入 DEM 模型 (HFA/GeoTIFF) <span class="badge">核心功能</span></h2>
+<div class="card">
+  <h3>什么是 DEM？</h3>
+  <p>DEM（Digital Elevation Model，数字高程模型）是一种存储地形高程数据的栅格文件。常见格式包括 ASTER GDEM（.img）、SRTM（.tif）、GeoTIFF（.tiff）等。每个像素代表地球表面该位置的海拔高度（单位：米）。</p>
+  <p>支持的数据源：</p>
+  <ul>
+    <li><strong>ASTER GDEM</strong> — 全球 30m 分辨率 DEM，来自 NASA/METI</li>
+    <li><strong>SRTM</strong> — 航天雷达地形测绘数据，30m/90m 分辨率</li>
+    <li><strong>自定义 GeoTIFF</strong> — 任何含高程数据的 GeoTIFF 文件</li>
+  </ul>
+  <div class="screenshot">📷 截图占位: DEM 文件导入流程</div>
+  
+  <h3>导入流程</h3>
+  <div class="step">
+    <strong>①</strong> 点击 <code>文件 → 导入 DEM 模型...</code><br>
+    <strong>②</strong> 在文件选择对话框中浏览到 .img 或 .tif 文件，点击"打开"<br>
+    <strong>③</strong> 系统读取 DEM 数据（自动过滤无效值、降采样），然后弹出 <strong>"垂直夸张系数"</strong> 对话框：<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;输入系数（>1 拉高山脉高度使地形更立体，<1 压低地形），默认值 2.0，范围 0.1~20.0<br>
+    <strong>④</strong> 确认对话框显示 DEM 信息：<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;· 网格大小：行数 × 列数<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;· X/Y 范围：地形实际尺寸（米）<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;· 高程范围：最低到最高海拔（米）<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;· 垂直夸张系数<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;· 坐标基准：EPSG 代码（如 EPSG:32652）<br>
+    <strong>⑤</strong> 点击"是"确认导入，场景自动执行以下操作：<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;· 清除所有旧场景对象（地形、飞机、河流等全部替换）<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;· 构建 DEM 三维地形表面<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;· 自动放置 2 架飞机在 7000m 高度（根据 DEM 尺寸自动缩放至 2000×）<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;· <strong>自动清空所有路径点</strong>（旧路径在新地形上无效）<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;· 自动调整 3D 相机距离以适应新地形大小<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;· 自动更新对象控制滑块范围<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;· 操作日志自动记录 "地形已变更 — 飞行已停止，路径点已清空"
+  </div>
+  <h3>导入后可以做什么</h3>
+  <ul>
+    <li>使用鼠标（左键旋转/滚轮缩放/中键平移）浏览三维地形</li>
+    <li>使用 <code>工具 → 重新调整 Z 垂直夸张</code> 随时修改地形起伏程度</li>
+    <li>在 DEM 地形上规划飞机飞行路径</li>
+  </ul>
+  <div class="note">✅ <strong>自动联动</strong>: DEM 导入后自动清空路径点、停止飞行、重置相机、更新滑块范围 — 无需手动干预。</div>
+</div>
+
+<h2 id="file-asc-import">3.6 导入 ASC 格网数据</h2>
+<div class="card">
+  <h3>什么是 ASC？</h3>
+  <p>ASC（ESRI ASCII Grid）是一种纯文本格式的高程数据文件，包含行列数、起始坐标、像元大小和高程值矩阵。常见于 GIS 软件（ArcGIS、QGIS）导出的数据。</p>
+  <div class="step">
+    <strong>①</strong> 点击 <code>文件 → 导入 ASC 格网数据...</code><br>
+    <strong>②</strong> 选择 .asc 文件<br>
+    <strong>③</strong> 系统解析文件头（ncols/nrows/xllcorner/yllcorner/cellsize/NODATA_value）和数据矩阵<br>
+    <strong>④</strong> 清除当前场景，使用 1.0× 垂直夸张构建地形<br>
+    <strong>⑤</strong> 自动调整相机和滑块范围
+  </div>
+</div>
+
+<h2 id="file-asc-export">3.7 导出 ASC 格网数据</h2>
+<div class="card">
+  <div class="step">
+    <strong>①</strong> 点击 <code>文件 → 导出 ASC 格网数据...</code>（仅在已加载地形时可用）<br>
+    <strong>②</strong> 选择保存路径和文件名<br>
+    <strong>③</strong> 当前地形的高程数据以标准 ESRI ASCII Grid 格式导出
+  </div>
+</div>
+
+<h2 id="file-export-model">3.8 导出选中模型</h2>
+<div class="card">
+  <p>将当前在 3D 视口中选中的对象导出为模型文件。</p>
+  <div class="step">
+    <strong>①</strong> 先在 3D 视口中单击选中对象<br>
+    <strong>②</strong> 点击 <code>文件 → 导出选中模型...</code><br>
+    <strong>③</strong> 选择保存位置和文件格式
+  </div>
+</div>
+
+<h2 id="file-export-log">3.9 导出操作日志</h2>
+<div class="card">
+  <div class="step">
+    <strong>①</strong> 点击 <code>文件 → 导出操作日志...</code><br>
+    <strong>②</strong> 选择保存位置（默认文件名 operation.log）<br>
+    <strong>③</strong> 底部操作日志面板的全部内容（带时间戳）被导出为 .log 文本文件
+  </div>
+</div>
+
+<h2 id="file-exit">3.10 退出</h2>
+<p>关闭软件。如果有未保存数据，系统不会自动提示（<strong>请在退出前手动保存</strong>）。</p>
+
+<!-- ═══════════════════════════════════════════════════ -->
+<h1 id="view">4. 视角菜单 (<code>视角</code>)</h1>
+
+<h2 id="view-preset">4.1 预设视角</h2>
+<div class="card">
+  <table>
+    <tr><th>菜单项</th><th>视角</th><th>说明</th></tr>
+    <tr><td>俯视</td><td>Top</td><td>从正上方垂直向下看，适合查看地形全貌</td></tr>
+    <tr><td>仰视</td><td>Bottom</td><td>从正下方垂直向上看</td></tr>
+    <tr><td>正视 (前/X轴)</td><td>Front</td><td>沿 X 轴正方向看向原点</td></tr>
+    <tr><td>侧视 (右/Y轴)</td><td>Side</td><td>沿 Y 轴正方向看向原点</td></tr>
+  </table>
+  <div class="tip">💡 <strong>DEM 场景</strong>: 相机距离会自动根据地形大小调整，确保整个地形在视野内。</div>
+</div>
+
+<h2 id="view-camera-reset">4.2 相机复位</h2>
+<p>将 3D 相机重置到默认视角（位置和焦点回到默认值），不改变任何对象的位置/姿态。</p>
+
+<h2 id="view-global-reset">4.3 全局复位 (所有对象) <span class="badge">⚠ 不可撤销</span></h2>
+<div class="card">
+  <p>将所有飞机和场景对象恢复到初始位置、初始姿态和初始缩放。执行前会弹出确认对话框。</p>
+  <div class="tip">⚠ <strong>警告</strong>: 此操作不可撤销（除非使用了 Ctrl+Z 撤销滑块调整）。</div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════ -->
+<h1 id="tools">5. 工具菜单 (<code>工具</code>)</h1>
+
+<h2 id="tools-measure">5.1 测距</h2>
+<div class="card">
+  <h3>操作流程</h3>
+  <div class="step">
+    <strong>①</strong> 点击 <code>工具 → 测距</code>（或工具栏"测距"按钮），鼠标变为十字光标<br>
+    <strong>②</strong> 在 3D 视口中点击第一个点（系统自动拾取该像素对应的三维表面位置）<br>
+    <strong>③</strong> 点击第二个点<br>
+    <strong>④</strong> 系统在两点之间绘制红色连线，中间显示距离值（单位：米），并在操作日志中记录 "测距：xxx 米"<br>
+    <strong>⑤</strong> 可以继续点击更多点进行多段测量<br>
+    <strong>⑥</strong> 再次点击 <code>工具 → 测距</code> 或点击其他模式退出
+  </div>
+  <div class="tip">💡 点击在空白处（未命中地形）时会显示提示 "⚠ 点击位置未命中地形表面，请重试"。</div>
+  <div class="screenshot">📷 截图占位: 测距示例</div>
+</div>
+
+<h2 id="tools-angle">5.2 测角</h2>
+<div class="card">
+  <div class="step">
+    <strong>①</strong> 点击 <code>工具 → 测角</code><br>
+    <strong>②</strong> 依次点击三个点：P1 (起点)、P2 (顶点)、P3 (终点)<br>
+    <strong>③</strong> 系统计算 ∠P1-P2-P3 的角度（单位：度），在顶点处显示角度标签，并在日志中记录 "测角：xxx°"<br>
+    <strong>④</strong> 再次点击三次可继续新的角度测量
+  </div>
+  <div class="screenshot">📷 截图占位: 测角示例</div>
+</div>
+
+<h2 id="tools-clear-meas">5.3 清除测量</h2>
+<p>移除 3D 视口中所有测距线和测角线。<strong>此操作不可撤销。</strong></p>
+
+<h2 id="tools-undo-meas">5.4 撤销上一步测量</h2>
+<p>撤销最近一次添加的测距或测角线段（仅限测量数据，不影响其他操作）。</p>
+
+<h2 id="tools-collision">5.5 碰撞检测</h2>
+<div class="card">
+  <div class="step">
+    <strong>①</strong> 点击 <code>工具 → 碰撞检测...</code><br>
+    <strong>②</strong> 系统使用 AABB（轴对齐包围盒）算法检测所有可见 3D 对象之间的碰撞<br>
+    <strong>③</strong> 结果以消息框形式显示所有相交的对象对
+  </div>
+</div>
+
+<h2 id="tools-reexag">5.6 重新调整 Z 垂直夸张 <span class="badge">DEM专用</span></h2>
+<div class="card">
+  <p>仅在已加载 DEM 地形时可用。允许在导入 DEM 后随时修改地形的 Z 轴夸张系数，地形即时更新无需重启。</p>
+  <div class="step">
+    <strong>①</strong> 点击 <code>工具 → 重新调整 Z 垂直夸张...</code><br>
+    <strong>②</strong> 输入新的夸张系数（0.1~20.0），点击"确定"<br>
+    <strong>③</strong> 地形表面即时重建并刷新，日志记录 "Z 垂直夸张: 旧值 → 新值"<br>
+    <strong>④</strong> 可以在"场景信息"对话框中实时查看当前夸张系数
+  </div>
+  <div class="note">✅ <strong>无需重启</strong>: 修改后立即生效。</div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════ -->
+<h1 id="layer">6. 图层菜单 (<code>图层</code>)</h1>
+
+<h2 id="layer-add">6.1 增加图层</h2>
+<div class="card">
+  <div class="step">
+    <strong>①</strong> 点击 <code>图层 → 增加图层...</code><br>
+    <strong>②</strong> 页面 1 — 选择需要管理的图层：勾选沙地/草地/土地/河流/植被，点击"下一步"<br>
+    <strong>③</strong> 页面 2 — 在 XY 平面图上绘制选区：<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;· 在右侧选择绘图工具（多边形）<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;· 在画布上点击绘制多边形顶点，鼠标悬停显示实时坐标<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;· 红色虚线预览当前点到鼠标位置的连线<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;· 右键点击闭合多边形<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;· 在左侧列表中选中已绘制的图形，可调整透明度或删除<br>
+    <strong>④</strong> 点击"确定"，选区内显示所选图层
+  </div>
+  <div class="screenshot">📷 截图占位: 图层管理对话框</div>
+</div>
+
+<h2 id="layer-manage">6.2 图层管理</h2>
+<p>打开图层管理对话框，除绘图功能外，还可对每个图层进行可见性切换和透明度调整。</p>
+
+<!-- ═══════════════════════════════════════════════════ -->
+<h1 id="help">7. 帮助菜单 (<code>帮助</code>)</h1>
+
+<h2>7.1 关于</h2>
+<p>显示软件版本信息（v2.5）和完整的 Release Notes（版本历史），包含所有功能的变更记录。</p>
+
+<h2>7.2 用户手册</h2>
+<p>点击后打开本页面（就是你正在阅读的这个）。</p>
+
+<!-- ═══════════════════════════════════════════════════ -->
+<h1 id="scene-tree">8. 场景树 (左侧 Dock) — 完整操作指南</h1>
+<div class="screenshot">📷 截图占位: 场景树全貌</div>
+
+<h2 id="tree-structure">8.1 树结构</h2>
+<pre style="background:#f5f5f5; padding: 12px; border-radius: 6px; font-size: 13px;">
+场景设置
+├── 📋 场景信息（双击）          → 场景属性只读查看窗口
+├── ✈ 飞行平台
+│   ├── aircraft                 → 双击：选中飞机，显示属性面板
+│   │   ├── 路径点 1             → 双击：编辑坐标
+│   │   └── 路径点 2
+│   └── aircraft2
+│       └── 路径点 1
+├── 🎯 路径规划
+│   ├── 添加/停止添加3D路径点（双击） → 双击：切换路径点模式
+│   ├── 精准添加路径（双击）     → 双击：打开 XY+Z 对话框
+│   └── 清除所有路径点（双击）   → 双击：确认后清除
+└── ▶ 动画与任务
+    ├── 开始飞行 / 停止飞行（双击） → 双击：选飞机后飞行
+    ├── 编队飞行                  → 双击：切换编队模式
+    ├── 保存飞行数据（双击）      → 双击：保存 JSON+3Dplot
+    └── 载入飞行数据（双击）      → 双击：载入并复现
+</pre>
+
+<h2 id="tree-scene-info">8.2 场景信息（双击）</h2>
+<div class="card">
+  <p>双击后弹出 <strong>独立场景信息窗口</strong>，显示以下只读属性（每 1 秒自动刷新）：</p>
+  <ul>
+    <li>作者</li>
+    <li>日期（自动更新为当天）</li>
+    <li>坐标系（默认 "东-北-天"，DEM 场景会附带 EPSG 代码，如 "EPSG:32652 (东-北-天)"）</li>
+    <li>当前地形尺寸（X 和 Y 跨度，单位：米）</li>
+    <li>Z 轴基准偏移（海平面 0 米）</li>
+    <li>边界锁定范围（X/Y/Z 最小到最大）</li>
+    <li>地形垂直夸张系数</li>
+    <li>默认相机视角（俯视/仰视/侧视/正视/透视）</li>
+  </ul>
+  <div class="screenshot">📷 截图占位: 场景信息窗口</div>
+</div>
+
+<h2 id="tree-aircraft">8.3 飞行平台 → aircraft 节点</h2>
+<div class="card">
+  <h3>单击选中</h3>
+  <p>单击 aircraft 节点 → 右侧属性面板自动切换为该飞机的专属控制面板，包含：</p>
+  <ul>
+    <li>选中对象下拉框（可在多个飞机间切换）</li>
+    <li>位置 X / Y / Z 滑块（范围自动适配场景尺寸）</li>
+    <li>缩放滑块（0.1 ~ 5.0）</li>
+    <li>航向角 (Yaw) 滑块（0° ~ 360°）</li>
+    <li>俯仰角 (Pitch) 滑块（-90° ~ +90°）</li>
+    <li>滚转角 (Roll) 滑块（-180° ~ +180°）</li>
+  </ul>
+  <p>任何滑块调整都会立即应用到 3D 视口中的飞机，并自动记录到操作日志。</p>
+  <p>按 <strong>Ctrl+Z</strong> 可撤销最近的滑块调整。</p>
+  <div class="screenshot">📷 截图占位: 属性面板 — 飞机控制</div>
+
+  <h3>双击 aircraft 节点</h3>
+  <p>自动在右侧属性面板选中该飞机（与单击 + 下拉框选择相同效果）。</p>
+
+  <h3>右键 → 删除</h3>
+  <p>弹出确认对话框，确认后永久删除该飞机（包括其所有路径点、变换数据、编队属性）。</p>
+
+  <h3>右键 → 重命名</h3>
+  <p>允许修改飞机在场景树中的显示名称。</p>
+</div>
+
+<h2 id="tree-waypoint">8.4 路径点子节点 (路径点 1, 路径点 2...)</h2>
+<div class="card">
+  <h3>双击 — 编辑坐标</h3>
+  <div class="step">
+    <strong>①</strong> 双击任意 "路径点 N" 节点<br>
+    <strong>②</strong> 弹出独立对话框，显示该点的 X、Y、Z 坐标<br>
+    <strong>③</strong> 修改坐标值（精确到 2 位小数），点击"确定"<br>
+    <strong>④</strong> 3D 视口中的路径点球立即移动到新位置，日志记录变更
+  </div>
+  <div class="screenshot">📷 截图占位: 路径点坐标编辑对话框</div>
+
+  <h3>右键 → 删除 / 点击 "- 删除" 按钮</h3>
+  <p>选中路径点 → 点击左上角 <strong>"- 删除"</strong> 按钮或右键删除 → 确认对话框 → 路径点从该飞机移除。</p>
+</div>
+
+<h2 id="tree-wp-mode">8.5 添加/停止添加3D路径点（双击）</h2>
+<div class="card">
+  <p>双击此节点 → 进入 <strong>路径点放置模式</strong>（光标变为十字），状态栏提示 "路径点模式 — 点击 3D 场景放置路径点"。</p>
+  <div class="step">
+    <strong>①</strong> 双击此节点进入模式<br>
+    <strong>②</strong> 在 3D 视口中单击目标位置<br>
+    <strong>③</strong> 弹出 <strong>"选择目标飞机"</strong> 对话框，列表中显示所有飞机<br>
+    <strong>④</strong> 勾选要把此路径点添加到的飞机（可多选：勾选 aircraft 和 aircraft2）<br>
+    <strong>⑤</strong> 点击"确定"，路径点以该飞机的专属颜色显示在 3D 视口中<br>
+    <strong>⑥</strong> 重复步骤 ②~⑤ 继续添加<br>
+    <strong>⑦</strong> 再次双击此节点 → 退出路径点模式
+  </div>
+  <div class="note">✅ <strong>每飞机独立颜色</strong>: aircraft=红色、aircraft2=蓝色、aircraft3=绿色...<br>
+  ✅ <strong>懒加载</strong>: 展开飞行平台下的 aircraft 节点即可看到路径点列表。<br>
+  ✅ <strong>自动展开</strong>: 添加路径点后 aircraft 节点自动展开。</div>
+  <div class="screenshot">📷 截图占位: 选择目标飞机对话框</div>
+</div>
+
+<h2 id="tree-precise">8.6 精准添加路径（双击）</h2>
+<div class="card">
+  <p>双击后打开 <strong>WaypointPreciseDialog</strong> 双步骤向导：</p>
+  <h3>Step 1 — XY 平面选择</h3>
+  <div class="step">
+    <strong>①</strong> 在 matplotlib 散点图上点击添加点（自动编号 A、B、C、D...）<br>
+    <strong>②</strong> 点之间用连线连接，预览路径走向<br>
+    <strong>③</strong> 下方表格显示所有点的 X/Y 坐标，可逐行删除<br>
+    <strong>④</strong> 也可直接输入 X/Y QDoubleSpinBox 精确编辑当前点坐标<br>
+    <strong>⑤</strong> "撤销上一点" 删除最后一个点<br>
+    <strong>⑥</strong> 地形等高线以灰色细线显示（辅助判断地形走向）<br>
+    <strong>⑦</strong> 至少 2 个点才能点击"下一步"
+  </div>
+  <div class="screenshot">📷 截图占位: 精准添加路径 Step1</div>
+
+  <h3>Step 2 — Z 高度剖面图</h3>
+  <div class="step">
+    <strong>①</strong> X 轴显示从起点到各点的累积路径距离，Y 轴显示 Z 高度<br>
+    <strong>②</strong> 水平滑块（QSlider）用于调整当前选中点的高度（-20 ~ 20 或 DEM 自动范围）<br>
+    <strong>③</strong> 滑块与 QDoubleSpinBox 双向同步<br>
+    <strong>④</strong> 点击图表切换选中点<br>
+    <strong>⑤</strong> 可随时回到 Step1 重新调整 XY 位置（进度保留，不会丢失）<br>
+    <strong>⑥</strong> 点击"确定"一次性添加所有点
+  </div>
+  <div class="screenshot">📷 截图占位: 精准添加路径 Step2</div>
+</div>
+
+<h2 id="tree-clear-wp">8.7 清除所有路径点（双击）</h2>
+<div class="card">
+  <div class="step">
+    <strong>①</strong> 双击 → 弹出确认对话框 "共 N 个路径点将被永久删除。此操作不可撤销。"<br>
+    <strong>②</strong> 点击"是" → <strong>所有飞机</strong>的所有路径点被清除，3D 视口中路径点球消失<br>
+    <strong>③</strong> 如果当前无路径点，显示提示 "⚠ 没有可清除的路径点"
+  </div>
+  <div class="tip">⚠ <strong>注意</strong>: 清除的是<strong>所有飞机</strong>的全部路径点。如需只删除某个飞机的某几个路径点，请在飞行平台下展开该飞机，选中路径点后点击 "- 删除"。</div>
+</div>
+
+<h2 id="tree-flight">8.8 开始飞行 / 停止飞行（双击）</h2>
+<div class="card">
+  <div class="step">
+    <strong>①</strong> 双击 → 弹出 <strong>"选择飞行飞机"</strong> 独立窗口<br>
+    <strong>②</strong> 在列表中选中要飞行的飞机，点击"确定"<br>
+    <strong>③</strong> 该飞机按 Catmull-Rom 样条曲线穿过其所有路径点<br>
+    <strong>④</strong> 飞行中：飞机位置/姿态实时更新，时间轴滚动<br>
+    <strong>⑤</strong> 再次双击 → 停止飞行
+  </div>
+  <h3>飞行中的飞机姿态</h3>
+  <ul>
+    <li><strong>航向角 (Yaw)</strong>: 根据当前段的方向矢量自动计算</li>
+    <li><strong>俯仰角 (Pitch)</strong>: 爬升时为负值，俯冲时为正值（±90° 范围内）</li>
+    <li><strong>滚转角 (Roll)</strong>: 当前为 0°</li>
+  </ul>
+  <h3>速度模型</h3>
+  <p>飞行速度 V = V₀ × k_pitch × k_turn（V₀ = 5.0 单位/秒）。</p>
+  <ul>
+    <li>爬升时减速（>30° → 70%），俯冲时加速（-30° → 117%）</li>
+    <li>转弯时减速（>100°/s → 30%），直飞时全速</li>
+  </ul>
+  <div class="screenshot">📷 截图占位: 飞行中</div>
+</div>
+
+<h2 id="tree-formation">8.9 编队飞行（双击）</h2>
+<div class="card">
+  <div class="step">
+    <strong>①</strong> 双击 → 切换编队模式（按钮高亮蓝色）<br>
+    <strong>②</strong> 下方列表显示所有飞机，勾选要编队的飞机<br>
+    <strong>③</strong> 第一个勾选的为<strong>领队 (leader)</strong>，其余为<strong>僚机 (follower)</strong><br>
+    <strong>④</strong> 编队模式下开始飞行：领队沿路径飞行，僚机自动跟随在领队后方<br>
+    <strong>⑤</strong> 再次双击 → 关闭编队模式
+  </div>
+  <div class="tip">💡 <strong>前提</strong>: 至少需要 1 架飞机。只有 1 架时仅该飞机飞行，无僚机。</div>
+  <div class="screenshot">📷 截图占位: 编队飞行</div>
+</div>
+
+<h2 id="tree-save-flight">8.10 保存飞行数据（双击）</h2>
+<div class="card">
+  <div class="step">
+    <strong>①</strong> 双击 → 弹出保存文件对话框<br>
+    <strong>②</strong> 保存为 JSON 文件到 <code>data/flight/</code> 目录<br>
+    <strong>③</strong> 同时自动生成 3D 散点图（<code>_3dplot.png</code>）：红色航点编号 + 蓝色飞行路径<br>
+    <strong>④</strong> 保存的内容包含路径点坐标、飞行段参数、速度模型数据
+  </div>
+</div>
+
+<h2 id="tree-load-flight">8.11 载入飞行数据（双击）</h2>
+<div class="card">
+  <div class="step">
+    <strong>①</strong> 双击 → 选择之前保存的 JSON 文件<br>
+    <strong>②</strong> 数据载入后自动开始飞行回放
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════ -->
+<h1 id="3d">9. 3D 视口交互</h1>
+<div class="screenshot">📷 截图占位: 3D视口交互标注</div>
+
+<h2>9.1 默认模式 (无工具激活时)</h2>
+<table>
+  <tr><th>操作</th><th>效果</th></tr>
+  <tr><td>左键拖拽</td><td>旋转相机（Trackball 模式）</td></tr>
+  <tr><td>滚轮</td><td>缩放相机（放大/缩小）</td></tr>
+  <tr><td>中键拖拽</td><td>平移相机</td></tr>
+  <tr><td>左键单击</td><td>选中 3D 对象（飞机、地形等），右侧属性面板自动切换</td></tr>
+  <tr><td>移动鼠标</td><td>底部坐标信息栏显示当前鼠标位置对应的 3D 世界坐标</td></tr>
+</table>
+
+<h2>9.2 测量模式 (测距/测角激活时)</h2>
+<table>
+  <tr><th>操作</th><th>效果</th></tr>
+  <tr><td>左键单击</td><td>放置测量点。每 2 点完成一段测距，每 3 点完成一次测角</td></tr>
+  <tr><td>左键拖拽</td><td>仍可旋转相机</td></tr>
+  <tr><td>滚轮</td><td>仍可缩放</td></tr>
+</table>
+
+<h2>9.3 路径点模式 (双击"添加/停止添加3D路径点"后)</h2>
+<table>
+  <tr><th>操作</th><th>效果</th></tr>
+  <tr><td>左键单击</td><td>拾取 3D 表面位置 → 弹出飞机选择对话框 → 添加路径点</td></tr>
+  <tr><td>左键拖拽</td><td>仍可旋转相机</td></tr>
+</table>
+
+<h2>9.4 飞行路径预览</h2>
+<p>开始飞行前，系统自动绘制一条<strong>青色半透明线</strong>穿过所有路径点，让您预览飞机将飞行的路线。</p>
+
+<!-- ═══════════════════════════════════════════════════ -->
+<h1 id="flight">10. 飞行动画 — 完整指南</h1>
+
+<div class="screenshot">📷 截图占位: 飞行动画全流程</div>
+
+<h2>10.1 飞行前准备</h2>
+<div class="step">
+  <strong>前提条件</strong>:<br>
+  ① 场景中存在至少 1 架飞机<br>
+  ② 目标飞机至少有 2 个路径点（在飞行平台下展开该飞机可见）<br>
+  ③ 路径点通过 8.5 节或 8.6 节的方法添加
+</div>
+
+<h2>10.2 开始飞行</h2>
+<div class="step">
+  <strong>①</strong> 展开 "动画与任务"，双击 <strong>"开始飞行 / 停止飞行（双击）"</strong><br>
+  <strong>②</strong> 在弹出窗口中选择要飞行的飞机 → 点击"确定"<br>
+  <strong>③</strong> 飞行路径预览线（青色）出现<br>
+  <strong>④</strong> 飞机瞬移到第一个路径点，开始沿样条曲线飞行<br>
+  <strong>⑤</strong> 底部时间轴实时更新，显示当前时间/总时间
+</div>
+
+<h2>10.3 飞行中交互</h2>
+<ul>
+  <li><strong>时间轴拖动</strong>: 拖动底部滑块可跳转到任意时刻（拖拽时飞行暂停，释放后恢复）</li>
+  <li><strong>时间轴点击</strong>: 点击滑块轨道可跳转到该时刻并继续播放</li>
+  <li><strong>停止飞行</strong>: 再次双击 "开始飞行 / 停止飞行（双击）"</li>
+  <li><strong>独立窗口选飞机</strong>: 飞行前均可通过独立对话框选择要飞行的飞机</li>
+</ul>
+
+<h2>10.4 多飞机独立路径点飞行 <span class="badge">v2.5新功能</span></h2>
+<p>每架飞机拥有<strong>独立的路径点列表</strong>和<strong>专属颜色</strong>。飞行时各自按自己的路径飞行。</p>
+<div class="step">
+  <strong>①</strong> 在路径点模式下，为 aircraft 添加一组红色路径点<br>
+  <strong>②</strong> 为 aircraft2 添加一组蓝色路径点<br>
+  <strong>③</strong> 双击 "开始飞行" → 选 aircraft → 沿红色路径点飞行<br>
+  <strong>④</strong> 停止后，双击 "开始飞行" → 选 aircraft2 → 沿蓝色路径点飞行
+</div>
+
+<h2>10.5 编队飞行</h2>
+<p>见 8.9 节。</p>
+
+<h2>10.6 飞行路径预览线</h2>
+<p>飞行启动后，青色预览线出现并保留在 3D 视口中。飞行结束后可通过"清除所有路径点"移除。</p>
+
+<!-- ═══════════════════════════════════════════════════ -->
+<h1 id="bottom">11. 底部面板</h1>
+
+<h2>11.1 操作日志 (左半部分)</h2>
+<p>记录所有用户操作的完整历史（带时间戳），包括但不限于：</p>
+<ul>
+  <li>增删飞机、路径点、图层</li>
+  <li>切换视角、复位</li>
+  <li>加载 DEM / ASC 数据</li>
+  <li>测距、测角、碰撞检测</li>
+  <li>编队飞行、保存/载入飞行数据</li>
+  <li>对象位置/姿态/缩放滑块调整（1.5s 去抖）</li>
+  <li>地形变更（自动记录）</li>
+  <li>Z 夸张调整（自动记录）</li>
+  <li>Ctrl+Z 撤销（自动记录）</li>
+</ul>
+<p>可通过 <code>文件 → 导出操作日志...</code> 导出为 .log 文件。</p>
+
+<h2>11.2 坐标信息 (右半部分)</h2>
+<p>实时显示鼠标在 3D 视口中的世界坐标 (X, Y, Z)，以及当前相机信息。</p>
+
+<h2>11.3 飞行时间轴 (底部Dock)</h2>
+<p>飞行时显示：当前时间 / 总时间 + 可拖动滑块。</p>
+
+<!-- ═══════════════════════════════════════════════════ -->
+<h1 id="properties">12. 属性面板 (右侧 Dock)</h1>
+<p>根据场景树中选中的节点类型，自动切换显示内容：</p>
+<table>
+  <tr><th>选中节点</th><th>面板内容</th></tr>
+  <tr><td>aircraft</td><td>位置 X/Y/Z 滑块、缩放滑块、航向角/俯仰角/滚转角滑块</td></tr>
+  <tr><td>路径点</td><td>路径点序号</td></tr>
+  <tr><td>动画与任务</td><td>飞行动画控制：选择飞机、开始飞行按钮、相机跟随、保存/载入飞行数据、编队飞行</td></tr>
+</table>
+
+<!-- ═══════════════════════════════════════════════════ -->
+<h1 id="shortcuts">13. 快捷键</h1>
+<table>
+  <tr><th>快捷键</th><th>功能</th></tr>
+  <tr><td>Ctrl+Z</td><td>撤销最近的滑块调整（对象位置/缩放/姿态）</td></tr>
+</table>
+
+<!-- ═══════════════════════════════════════════════════ -->
+<h1 id="faq">14. 常见问题</h1>
+
+<div class="card">
+  <h3>Q: DEM 导入后路径点全没了？</h3>
+  <p>A: 这是<strong>预期行为</strong>。DEM 导入后旧地形上的路径点在新地形上无效，系统自动清空所有路径点。这是事件驱动的自动保护机制。</p>
+</div>
+
+<div class="card">
+  <h3>Q: DEM 地形中飞机太小/太大？</h3>
+  <p>A: DEM 场景中飞机自动缩放至 2000× 以匹配地形尺寸（~136km 对角线）。如需调整飞机大小，选中飞机后在右侧属性面板调整"缩放"滑块。</p>
+</div>
+
+<div class="card">
+  <h3>Q: DEM 导入后再加载默认地形，地形像一个小点？</h3>
+  <p>A: v2.5 已修复。切换回默认场景时，相机会自动重置到默认距离（18 单位），默认地形会在视口中正常显示。</p>
+</div>
+
+<div class="card">
+  <h3>Q: 路径点删不了？</h3>
+  <p>A: 确保<strong>展开</strong>了飞行平台下的 aircraft 节点，<strong>选中</strong>具体的路径点子节点，再点击"- 删除"按钮或右键删除。v2.5 已修复该 Bug。</p>
+</div>
+
+<div class="card">
+  <h3>Q: 如何只删除某个飞机的路径点？</h3>
+  <p>A: 展开 aircraft → 逐个选中路径点 → 点击"- 删除"。注意"清除所有路径点"会清除<strong>全部飞机</strong>的路径点。</p>
+</div>
+
+<div class="card">
+  <h3>Q: 不小心拖了滑块怎么恢复？</h3>
+  <p>A: 按 <strong>Ctrl+Z</strong> 撤销最近一次滑块调整（最多 50 步撤销栈）。</p>
+</div>
+
+<div class="card">
+  <h3>Q: 程序启动很慢（30秒以上）？</h3>
+  <p>A: 如使用 macOS Apple Silicon + x86_64 Anaconda（Rosetta 2），启动可能较慢。详见 known_issues.md ID-39。</p>
+</div>
+
+<div class="card">
+  <h3>Q: 点击 3D 视口放路径点但点出现在奇怪的位置？</h3>
+  <p>A: 请确认程序已启动完毕，且鼠标点击到了地形表面（不是空白区域）。如果反复出现，请检查 Retina 屏幕缩放设置。</p>
+</div>
+
+<hr style="margin: 40px 0">
+<p style="text-align: center; color: #999; font-size: 13px;">3DSceneSoftware v2.5 用户手册 · 2026-07-08 · 如需协助，请查阅 known_issues.md 或联系开发者</p>
+
+</div>
+</body>
+</html>

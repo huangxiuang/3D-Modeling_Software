@@ -19,6 +19,7 @@ import os
 import json
 import math
 import time
+import webbrowser
 import numpy as np
 import pyvista as pv
 from vtkmodules.vtkCommonCore import vtkStringArray
@@ -612,6 +613,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ── Help ──
         hm = mb.addMenu("帮助 (&H)")
+        hm.addAction("用户手册", self._open_user_manual)
+        hm.addSeparator()
         hm.addAction("关于", self._show_about)
 
         # Register for mode-button syncing
@@ -4032,6 +4035,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self.plotter.close()
         except Exception:
             pass
+
+    def _open_user_manual(self):
+        manual_path = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "docs", "user_manual.html")
+        try:
+            webbrowser.open("file://" + manual_path)
+        except Exception:
+            QtWidgets.QMessageBox.warning(self, "打开失败",
+                f"无法打开用户手册。\n路径: {manual_path}")
 
     def _show_about(self):
         dlg = AboutDialog(self)
