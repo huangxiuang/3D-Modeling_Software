@@ -267,6 +267,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # Undo stack for slider adjustments (max 20 entries per object)
         self._undo_stack = []           # [(name, {"offset": [...], "scale": ..., "yaw": ..., "pitch": ..., "roll": ...})]
 
+        # Per-aircraft waypoint colours (for visual distinction)
+        self._aircraft_colors = {}      # name → colour hex string
+        self._color_palette = ["#E53935", "#1E88E5", "#43A047", "#FB8C00",
+                               "#8E24AA", "#00ACC1", "#F4511E", "#546E7A"]
+
         # Timeline (ID-20)
         self._total_flight_steps = 0
         self._total_flight_time_ms = 0
@@ -931,7 +936,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._edit_waypoint_dialog(ac_name, wp_idx)
 
     def _edit_waypoint_dialog(self, ac_name, wp_idx):
-        waypoints = self._aircraft_waypoints.get(ac_name) or self.waypoints
+        waypoints = self._aircraft_waypoints.get(ac_name, [])
         if wp_idx < 0 or wp_idx >= len(waypoints):
             return
         wp = waypoints[wp_idx]
@@ -1119,6 +1124,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._add_actor(new_name, self.scene_objects[new_name])
         self._insert_aircraft_node(new_name)
         self._refresh_ui()
+        # Assign color for new aircraft
+        idx = len(self._aircraft_colors)
+        self._aircraft_colors[new_name] = self._color_palette[idx % len(self._color_palette)]
         self._log_action(f"用户增加了飞机: {new_name}")
         self.statusBar().showMessage("已添加新飞机: {}".format(new_name), 3000)
 
@@ -1145,16 +1153,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scene_objects.pop(name, None)
         self._obj_transforms.pop(name, None)
         self._aircraft_waypoints.pop(name, None)
+        self._aircraft_colors.pop(name, None)
+        # Remove from formation list if present
+        if name in self._formation_aircraft:
+            self._formation_aircraft.remove(name)
+            self._formation_offsets.pop(name, None)
+        self._rebuild_waypoint_actors()
         self._log_action(f"用户删除了飞机: {name}")
 
     def _delete_waypoint(self, ac_name, wp_idx):
         if wp_idx is None:
             return
-        waypoints = self._aircraft_waypoints.get(ac_name) or self.waypoints
+        waypoints = self._aircraft_waypoints.get(ac_name, [])
         if 0 <= wp_idx < len(waypoints):
             waypoints.pop(wp_idx)
+            if not waypoints:
+                self._aircraft_waypoints.pop(ac_name, None)
         self._rebuild_waypoint_actors()
-        self._log_action(f"用户删除了路径点 #{wp_idx + 1}")
+        self._log_action(f"用户删除了 {ac_name} 的路径点 #{wp_idx + 1}")
 
     def _rebuild_waypoint_actors(self):
         for a in self._wp_actors:
@@ -1169,17 +1185,22 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
             self._path_actor = None
-        waypoints = self.waypoints
-        for i, wp in enumerate(waypoints):
-            sphere = pv.Sphere(radius=0.15, center=wp)
-            actor = self.plotter.add_mesh(sphere, color="red", smooth_shading=True)
-            self._wp_actors.append(actor)
-            label_actor = self.plotter.add_point_labels(
-                np.array([wp]), [str(i + 1)],
-                show_points=False, font_size=14, text_color="red",
-                shape_opacity=0.0, always_visible=True,
-            )
-            self._wp_actors.append(label_actor)
+        # Draw per-aircraft waypoints with distinct colours
+        global_idx = 1
+        for ac_name, wps in self._aircraft_waypoints.items():
+            color = self._aircraft_colors.get(ac_name, "red")
+            for wp in wps:
+                wp_arr = np.asarray(wp)
+                sphere = pv.Sphere(radius=0.15, center=wp_arr)
+                actor = self.plotter.add_mesh(sphere, color=color, smooth_shading=True)
+                self._wp_actors.append(actor)
+                label_actor = self.plotter.add_point_labels(
+                    np.array([wp_arr]), [f"{global_idx}"],
+                    show_points=False, font_size=14, text_color=color,
+                    shape_opacity=0.0, always_visible=True,
+                )
+                self._wp_actors.append(label_actor)
+                global_idx += 1
         self.plotter.render()
 
     def _populate_aircraft_nodes(self):
@@ -1197,7 +1218,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _lazy_load_waypoints(self, aircraft_item, aircraft_name):
         if aircraft_item.childCount() > 0:
             return
-        waypoints = self._aircraft_waypoints.get(aircraft_name) or self.waypoints
+        waypoints = self._aircraft_waypoints.get(aircraft_name, [])
         for i in range(len(waypoints)):
             wp = waypoints[i]
             time_label = "t={:.1f}s".format(i * 5.0)
@@ -2941,36 +2962,48 @@ class MainWindow(QtWidgets.QMainWindow):
     # ═══════════════════════════════════════════════════════════════
 
     def _add_waypoint(self, world_pos):
-        """Add a waypoint from a 3D click."""
-        self.waypoints.append(np.asarray(world_pos))
-        idx = len(self.waypoints)
+        """Add a 3D waypoint → show dialog to select target aircraft(s)."""
+        names = [n for n in self.scene_objects if "aircraft" in n.lower()]
+        if not names:
+            self.statusBar().showMessage("⚠ 当前场景无飞机", 3000)
+            return
+        # Auto-assign colours for new aircraft
+        for i, n in enumerate(names):
+            if n not in self._aircraft_colors:
+                self._aircraft_colors[n] = self._color_palette[i % len(self._color_palette)]
 
-        sphere = pv.Sphere(radius=0.15, center=world_pos)
-        actor = self.plotter.add_mesh(
-            sphere, color="red", smooth_shading=True
-        )
-        self._wp_actors.append(actor)
-
-        label_actor = self.plotter.add_point_labels(
-            np.array([world_pos]),
-            [str(idx)],
-            show_points=False,
-            font_size=14,
-            text_color="red",
-            shape_opacity=0.0,
-            always_visible=True,
-        )
-        self._wp_actors.append(label_actor)
-
-        self.plotter.render()
-        self._log_action(
-            f"用户添加了路径点 #{idx}: ({world_pos[0]:.2f}, {world_pos[1]:.2f}, {world_pos[2]:.2f})")
-        self.statusBar().showMessage(
-            f"路径点 #{idx}:  {world_pos[0]:.2f}, {world_pos[1]:.2f}, {world_pos[2]:.2f}",
-            3000,
-        )
-        # Auto-expand aircraft node so user can see and edit waypoints
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("选择目标飞机")
+        dlg.setWindowFlags(dlg.windowFlags() | QtCore.Qt.Window)
+        dlg.resize(300, 220)
+        lo = QtWidgets.QVBoxLayout(dlg)
+        lo.addWidget(QtWidgets.QLabel("将此路径点添加到:"))
+        checks = {}
+        for n in names:
+            chk = QtWidgets.QCheckBox(n)
+            chk.setChecked(True)
+            lo.addWidget(chk)
+            checks[n] = chk
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        lo.addWidget(btns)
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        wp = np.asarray(world_pos)
+        added = []
+        for n in names:
+            if checks[n].isChecked():
+                self._aircraft_waypoints.setdefault(n, []).append(wp.copy())
+                added.append(n)
+        if not added:
+            return
+        self._rebuild_waypoint_actors()
         self._refresh_waypoint_tree()
+        names_str = ", ".join(added)
+        self._log_action(f"添加路径点 ({wp[0]:.2f}, {wp[1]:.2f}, {wp[2]:.2f}) → {names_str}")
+        self.statusBar().showMessage(f"路径点已添加到: {names_str}", 3000)
 
     def _refresh_waypoint_tree(self):
         """Refresh waypoint tree nodes under all aircraft — auto-expand."""
